@@ -11,6 +11,7 @@ import (
 
 	"engram/internal/control"
 	"engram/internal/store"
+	"engram/internal/worktree"
 )
 
 func initTempGitRepo(t *testing.T) string {
@@ -29,6 +30,7 @@ func initTempGitRepo(t *testing.T) string {
 	runGit("init")
 	runGit("config", "user.email", "engram-test@local")
 	runGit("config", "user.name", "Engram Test")
+	runGit("config", "core.autocrlf", "false")
 
 	readme := filepath.Join(dir, "README.md")
 	if err := os.WriteFile(readme, []byte("# test repo\n"), 0o644); err != nil {
@@ -234,6 +236,100 @@ func TestCLIRewindLooksUpStepSHAAndInvokesRewinder(t *testing.T) {
 	}
 	if !strings.Contains(out, "1111bbbb") {
 		t.Fatalf("rewind output missing short SHA:\n%s", out)
+	}
+}
+
+func TestCLIRewindIntegrationWithWorktreeManager(t *testing.T) {
+	repo := initTempGitRepo(t)
+	if _, err := executeCLI(Dependencies{}, "init", "--repo", repo); err != nil {
+		t.Fatalf("engram init error = %v", err)
+	}
+
+	ws := control.Workspace{RepoRoot: repo}
+	ctx := context.Background()
+
+	mgr, err := worktree.NewManager(ws.RepoRoot, ws.WorktreesDir())
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	const sessID = "sess_wt_rewind"
+	sessWT, err := mgr.Create(ctx, sessID, "")
+	if err != nil {
+		t.Fatalf("mgr.Create() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = mgr.Remove(ctx, sessWT.WorktreePath)
+	})
+
+	if err := os.WriteFile(filepath.Join(sessWT.WorktreePath, "README.md"), []byte("# step 1\n"), 0o644); err != nil {
+		t.Fatalf("write step 1 README: %v", err)
+	}
+	step1Commit, err := mgr.CommitStep(ctx, sessWT.WorktreePath, 1, "step 1")
+	if err != nil {
+		t.Fatalf("CommitStep(1) error = %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(sessWT.WorktreePath, "README.md"), []byte("# step 2\n"), 0o644); err != nil {
+		t.Fatalf("write step 2 README: %v", err)
+	}
+	step2Commit, err := mgr.CommitStep(ctx, sessWT.WorktreePath, 2, "step 2")
+	if err != nil {
+		t.Fatalf("CommitStep(2) error = %v", err)
+	}
+
+	st, err := store.Open(ctx, ws.StateDBPath())
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	if err := st.CreateSession(ctx, store.Session{
+		ID:            sessID,
+		TaskPrompt:    "Test real rewind",
+		BaseCommitSHA: sessWT.BaseCommitSHA,
+		WorktreePath:  sessWT.WorktreePath,
+		Status:        store.SessionRunning,
+	}); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if err := st.CreateStep(ctx, store.Step{
+		ID:           "st_1",
+		SessionID:    sessID,
+		StepIndex:    1,
+		GitCommitSHA: step1Commit.CommitSHA,
+	}); err != nil {
+		t.Fatalf("CreateStep(1) error = %v", err)
+	}
+	if err := st.CreateStep(ctx, store.Step{
+		ID:           "st_2",
+		SessionID:    sessID,
+		StepIndex:    2,
+		GitCommitSHA: step2Commit.CommitSHA,
+	}); err != nil {
+		t.Fatalf("CreateStep(2) error = %v", err)
+	}
+	_ = st.Close()
+
+	// Use defaultDependencies() to exercise the real worktree.Manager wiring.
+	out, err := executeCLI(defaultDependencies(), "rewind", sessID, "--step", "1", "--repo", repo)
+	if err != nil {
+		t.Fatalf("engram rewind error = %v\noutput:\n%s", err, out)
+	}
+
+	gotBytes, err := os.ReadFile(filepath.Join(sessWT.WorktreePath, "README.md"))
+	if err != nil {
+		t.Fatalf("read rewound README.md: %v", err)
+	}
+	if string(gotBytes) != "# step 1\n" {
+		t.Fatalf("rewound README.md = %q, want %q", string(gotBytes), "# step 1\n")
+	}
+
+	// Host repo README must remain untouched.
+	hostBytes, err := os.ReadFile(filepath.Join(repo, "README.md"))
+	if err != nil {
+		t.Fatalf("read host README.md: %v", err)
+	}
+	if string(hostBytes) != "# test repo\n" {
+		t.Fatalf("host README.md = %q, want %q", string(hostBytes), "# test repo\n")
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"engram/internal/control"
 	"engram/internal/store"
+	"engram/internal/worktree"
 )
 
 // RunRequest captures the validated inputs for `engram run`.
@@ -42,8 +43,24 @@ type Dependencies struct {
 	Rewinder WorktreeRewinder
 }
 
+type defaultWorktreeRewinder struct{}
+
+func (defaultWorktreeRewinder) Rewind(ctx context.Context, ws control.Workspace, sess store.Session, target store.Step) error {
+	mgr, err := worktree.NewManager(ws.RepoRoot, ws.WorktreesDir())
+	if err != nil {
+		return err
+	}
+	return mgr.Rewind(ctx, sess.WorktreePath, target.GitCommitSHA)
+}
+
+func defaultDependencies() Dependencies {
+	return Dependencies{
+		Rewinder: defaultWorktreeRewinder{},
+	}
+}
+
 func main() {
-	cmd := NewRootCmd(Dependencies{})
+	cmd := NewRootCmd(defaultDependencies())
 	if err := cmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -52,6 +69,10 @@ func main() {
 
 // NewRootCmd constructs the Engram Cobra command tree.
 func NewRootCmd(deps Dependencies) *cobra.Command {
+	if deps.Rewinder == nil {
+		deps.Rewinder = defaultWorktreeRewinder{}
+	}
+
 	var repoDir string
 
 	root := &cobra.Command{
@@ -204,10 +225,6 @@ func newRewindCmd(repoDir *string, rewinder WorktreeRewinder) *cobra.Command {
 			targetStep, err := st.GetStepByIndex(ctx, sessionID, stepIndex)
 			if err != nil {
 				return fmt.Errorf("load step %d for session %q: %w", stepIndex, sessionID, err)
-			}
-
-			if rewinder == nil {
-				return fmt.Errorf("worktree rewinder is not configured (target commit %s)", targetStep.GitCommitSHA)
 			}
 
 			if err := rewinder.Rewind(ctx, ws, sess, targetStep); err != nil {
