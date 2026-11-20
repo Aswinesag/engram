@@ -25,6 +25,7 @@ func initTestRepo(t *testing.T) (repoRoot, worktreesDir string) {
 	run("init")
 	run("config", "user.email", "test@engram.local")
 	run("config", "user.name", "Engram Test")
+	run("config", "core.autocrlf", "false")
 
 	if err := os.WriteFile(filepath.Join(dir, "app.txt"), []byte("v1\n"), 0o644); err != nil {
 		t.Fatalf("write app.txt: %v", err)
