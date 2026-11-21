@@ -28,6 +28,9 @@ _LINE_COL_RE = re.compile(r":\d+(?::\d+)?\b")
 _ERROR_LINE_RE = re.compile(
     r"(?im)^.*(?:error|exception|failed|refused|denied|timeout|traceback|enoent|econnrefused|not found).*$"
 )
+_SUMMARY_CMD_RE = re.compile(
+    r"(?:ran|running|command)\s+['\"`]([^'\"`]+)['\"`]", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -114,13 +117,18 @@ class FrictionEvent:
             tool_name=tool_name,
             detail=summary,
         )
+        command_sample = str(data.get("command_sample", "")).strip()
+        if not command_sample and summary:
+            cmd_match = _SUMMARY_CMD_RE.search(summary)
+            if cmd_match:
+                command_sample = cmd_match.group(1).strip()
         return cls(
             step_range=[int(step_range[0]), int(step_range[1])],
             pattern=pattern,
             tool_name=tool_name,
             summary=summary,
             failure_signature=sig,
-            command_sample=str(data.get("command_sample", "")),
+            command_sample=command_sample,
             error_sample=str(data.get("error_sample", "")),
             target_paths=[str(p) for p in data.get("target_paths", [])],
             exit_codes=[int(c) for c in data.get("exit_codes", [])],
