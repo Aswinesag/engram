@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -419,12 +418,7 @@ func newBuiltinWorktreeServer(worktreePath string) *server.MCPServer {
 			runCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
-			var cmd *exec.Cmd
-			if runtime.GOOS == "windows" {
-				cmd = exec.CommandContext(runCtx, "cmd", "/C", command)
-			} else {
-				cmd = exec.CommandContext(runCtx, "sh", "-c", command)
-			}
+			cmd := buildShellCommand(runCtx, command)
 			cmd.Dir = worktreePath
 
 			var combined bytes.Buffer

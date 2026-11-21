@@ -242,7 +242,7 @@ sys.exit(0)
 		case 1:
 			// Turn 1: LLM tries to run main.py immediately -> blocked by exit 2 hook!
 			writeAnthropicToolTurn(w, "Let me run main.py first.", "t1", "bash", map[string]any{
-				"command": pyBin + " main.py",
+				"command": fmt.Sprintf(`"%s" main.py`, pyBin),
 			})
 		case 2:
 			// Verify hook exit 2 guidance was fed back into the LLM prompt.
@@ -256,7 +256,7 @@ sys.exit(0)
 			})
 		case 3:
 			// Turn 3: LLM runs a command emitting > 100 tokens to trigger artifact spill (Invariant #5).
-			cmd := fmt.Sprintf(`%s -c "print('START_LOG'); print('X' * 1200); print('END_LOG')"`, pyBin)
+			cmd := fmt.Sprintf(`"%s" -c "print('START_LOG'); print('X' * 1200); print('END_LOG')"`, pyBin)
 			writeAnthropicToolTurn(w, "Running verbose check.", "t3", "bash", map[string]any{
 				"command": cmd,
 			})
