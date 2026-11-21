@@ -1,0 +1,75 @@
+version: 2
+
+project_name: engram
+
+before:
+  hooks:
+    - go mod tidy
+    - sh -c "cd ui && npm ci && npm run build"
+    - sh -c "cd compiler && uv build"
+
+builds:
+  - id: engram
+    main: ./cmd/engram
+    binary: engram
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    ids:
+      - engram
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE*
+      - README*
+
+release:
+  extra_files:
+    - glob: compiler/dist/*.whl
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+homebrew_casks:
+  - name: engram
+    ids:
+      - default
+    binaries:
+      - engram
+    directory: Casks
+    homepage: https://github.com/engram-ai/engram
+    description: Self-evolving local agent runtime and deterministic harness compiler
+    dependencies:
+      - formula: git
+      - formula: python@3.12
+    repository:
+      owner: "{{ .Env.ENGRAM_BREW_TAP_OWNER }}"
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

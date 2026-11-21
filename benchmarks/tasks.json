@@ -1,0 +1,27 @@
+{
+  "suite": "engram-continual-learning-v1",
+  "runs_per_task": 3,
+  "tasks": [
+    {
+      "task_id": "swe_db_port_prereq",
+      "category": "REPEATED_TOOL_ERROR",
+      "description": "API integration tests fail with ConnectionRefusedError until local DB service is started.",
+      "prompt": "Run the payments API integration test suite and ensure all tests pass.",
+      "verify_cmd": "pytest tests/api"
+    },
+    {
+      "task_id": "swe_composite_migration_chain",
+      "category": "MULTI_STEP_COMMAND_PATTERN",
+      "description": "Fragile multi-step schema setup and migration sequence repeated across sessions.",
+      "prompt": "Prepare the test database schema and verify migrations cleanly.",
+      "verify_cmd": "python verify_migration.py"
+    },
+    {
+      "task_id": "swe_circular_async_edit",
+      "category": "CIRCULAR_FILE_EDIT",
+      "description": "Circular edits to async endpoint module before applying repository async conventions.",
+      "prompt": "Fix async session handling in src/api/payments.py and verify unit tests.",
+      "verify_cmd": "python verify_async.py"
+    }
+  ]
+}
