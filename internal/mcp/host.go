@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -18,6 +17,8 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	mcpproto "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"engram/internal/sandbox"
 )
 
 const (
@@ -35,6 +36,14 @@ var (
 	// ErrOutsideWorktree enforces Invariant #1 for built-in file tools.
 	ErrOutsideWorktree = errors.New("mcp: path escapes isolated worktree boundary")
 )
+
+// HostOptions configures optional runtime integrations for the MCP Host.
+type HostOptions struct {
+	// CommandRunner executes the built-in `bash` tool inside the configured
+	// Native Fast Mode or Strict Container Mode sandbox. When nil, a default
+	// NativeRunner is created automatically.
+	CommandRunner sandbox.Runner
+}
 
 // ToolDefinition describes an MCP tool exposed to the LLM router.
 type ToolDefinition struct {
@@ -77,9 +86,15 @@ type Host struct {
 	routes  map[string]toolRoute
 }
 
-// NewHost initializes an MCP Host bound to an isolated session worktree and
-// mounts the built-in worktree-scoped MCP server in-process.
+// NewHost initializes an MCP Host bound to an isolated session worktree using
+// the default native sandbox runner.
 func NewHost(ctx context.Context, worktreePath string) (*Host, error) {
+	return NewHostWithOptions(ctx, worktreePath, HostOptions{})
+}
+
+// NewHostWithOptions initializes an MCP Host bound to worktreePath with an
+// explicit sandbox.Runner for shell command isolation.
+func NewHostWithOptions(ctx context.Context, worktreePath string, opts HostOptions) (*Host, error) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return nil, errors.New("mcp: worktreePath must not be empty")
 	}
@@ -99,13 +114,22 @@ func NewHost(ctx context.Context, worktreePath string) (*Host, error) {
 		return nil, fmt.Errorf("mcp: worktreePath %q is not a directory", absWT)
 	}
 
+	cmdRunner := opts.CommandRunner
+	if cmdRunner == nil {
+		var err error
+		cmdRunner, err = sandbox.NewNativeRunner(sandbox.Config{Mode: sandbox.ModeNative})
+		if err != nil {
+			return nil, fmt.Errorf("mcp: create default sandbox runner: %w", err)
+		}
+	}
+
 	h := &Host{
 		worktreePath: filepath.Clean(absWT),
 		servers:      make(map[string]*mountedServer),
 		routes:       make(map[string]toolRoute),
 	}
 
-	builtinSrv := newBuiltinWorktreeServer(h.worktreePath)
+	builtinSrv := newBuiltinWorktreeServer(h.worktreePath, cmdRunner)
 	inProcClient, err := client.NewInProcessClient(builtinSrv)
 	if err != nil {
 		return nil, fmt.Errorf("mcp: create in-process builtin client: %w", err)
@@ -304,7 +328,7 @@ func (h *Host) Close() error {
 	return errors.Join(errs...)
 }
 
-func newBuiltinWorktreeServer(worktreePath string) *server.MCPServer {
+func newBuiltinWorktreeServer(worktreePath string, cmdRunner sandbox.Runner) *server.MCPServer {
 	s := server.NewMCPServer(
 		"engram-worktree-builtin",
 		"1.0.0",
@@ -401,7 +425,7 @@ func newBuiltinWorktreeServer(worktreePath string) *server.MCPServer {
 	s.AddTool(
 		mcpproto.NewTool(
 			"bash",
-			mcpproto.WithDescription("Execute a shell command inside the isolated session worktree."),
+			mcpproto.WithDescription("Execute a sandboxed shell command inside the isolated session worktree."),
 			mcpproto.WithString("command", mcpproto.Required(), mcpproto.Description("Shell command to run")),
 			mcpproto.WithNumber("timeout_seconds", mcpproto.Description("Optional timeout in seconds (default 60)")),
 		),
@@ -415,32 +439,21 @@ func newBuiltinWorktreeServer(worktreePath string) *server.MCPServer {
 				timeout = time.Duration(secs * float64(time.Second))
 			}
 
-			runCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-
-			cmd := buildShellCommand(runCtx, command)
-			cmd.Dir = worktreePath
-
-			var combined bytes.Buffer
-			cmd.Stdout = &combined
-			cmd.Stderr = &combined
-
-			runErr := cmd.Run()
-			output := combined.String()
-			if runErr == nil {
-				return mcpproto.NewToolResultText(output), nil
+			execRes, runErr := cmdRunner.Run(ctx, sandbox.ExecRequest{
+				Command:      command,
+				WorktreePath: worktreePath,
+				Timeout:      timeout,
+			})
+			if runErr != nil {
+				return mcpproto.NewToolResultError(fmt.Sprintf("exit_code=1\nsandbox execution error: %v\n%s", runErr, execRes.Output)), nil
 			}
-
-			if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-				return mcpproto.NewToolResultError(fmt.Sprintf("exit_code=124\ncommand timed out after %s\n%s", timeout, output)), nil
+			if execRes.TimedOut {
+				return mcpproto.NewToolResultError(fmt.Sprintf("exit_code=124\ncommand timed out after %s\n%s", timeout, execRes.Output)), nil
 			}
-
-			exitCode := 1
-			var exitErr *exec.ExitError
-			if errors.As(runErr, &exitErr) {
-				exitCode = exitErr.ExitCode()
+			if execRes.ExitCode != 0 {
+				return mcpproto.NewToolResultError(fmt.Sprintf("exit_code=%d\n%s", execRes.ExitCode, execRes.Output)), nil
 			}
-			return mcpproto.NewToolResultError(fmt.Sprintf("exit_code=%d\n%s", exitCode, output)), nil
+			return mcpproto.NewToolResultText(execRes.Output), nil
 		},
 	)
 
@@ -465,7 +478,6 @@ func resolveWorktreePath(worktreeRoot, userPath string) (string, error) {
 		return "", fmt.Errorf("%w: %q", ErrOutsideWorktree, userPath)
 	}
 
-	// Verify existing symlinks do not escape worktreeRoot.
 	if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
 		relResolved, relErr := filepath.Rel(worktreeRoot, resolved)
 		if relErr != nil || relResolved == ".." || strings.HasPrefix(relResolved, ".."+string(filepath.Separator)) {
@@ -491,7 +503,6 @@ func resolveToolScriptPath(toolsDir, relFilePath string) (string, error) {
 	}
 
 	cleaned := filepath.Clean(filepath.FromSlash(relFilePath))
-	// Accept either "tools/foo.py", ".engram/tools/foo.py", or "foo.py".
 	basePrefix := "tools" + string(filepath.Separator)
 	engramPrefix := ".engram" + string(filepath.Separator) + basePrefix
 	switch {
@@ -539,8 +550,6 @@ func toolMutatesFiles(serverName, toolName string) bool {
 			return true
 		}
 	}
-	// External and synthesized MCP tools are conservatively treated as potentially mutating
-	// so the runtime takes an atomic shadow commit check afterward.
 	return true
 }
 

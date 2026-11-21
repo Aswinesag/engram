@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -410,4 +411,102 @@ func mustJSON(v any) json.RawMessage {
 func mustJSONString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+func TestPhase2SecurityIntegrationScrubsLLMPayloadAndInjectsEgressProxy(t *testing.T) {
+	ctx := context.Background()
+	ws := initTestGitRepoForAgent(t)
+
+	// Place a repo .env file containing a custom secret AND set a host API key env var.
+	const dotEnvSecret = "pay_live_engram_dotenv_secret_99"
+	const hostSecret = "sk-ant-host-secret-must-not-leak-1234567890"
+	if err := os.WriteFile(filepath.Join(ws.RepoRoot, ".env"),
+		[]byte("PAYMENTS_SECRET="+dotEnvSecret+"\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	t.Setenv("ANTHROPIC_API_KEY", hostSecret)
+
+	st, err := store.Open(ctx, ws.StateDBPath())
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	var turnCount atomic.Int32
+	var turn2Body atomic.Value
+
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+
+		switch turnCount.Add(1) {
+		case 1:
+			// Ask bash to print HTTP_PROXY, ANTHROPIC_API_KEY, and simulated leaked secrets.
+			cmd := fmt.Sprintf(`echo "PROXY=${HTTP_PROXY} HOSTKEY=${ANTHROPIC_API_KEY} LEAK=%s PEM=-----BEGIN OPENSSH PRIVATE KEY-----"`, dotEnvSecret)
+			if runtime.GOOS == "windows" {
+				cmd = fmt.Sprintf(`echo PROXY=%%HTTP_PROXY%% HOSTKEY=%%ANTHROPIC_API_KEY%% LEAK=%s PEM=-----BEGIN OPENSSH PRIVATE KEY-----`, dotEnvSecret)
+			}
+			writeAnthropicToolTurn(w, "Inspecting environment.", "s1", "bash", map[string]any{
+				"command": cmd,
+			})
+		case 2:
+			turn2Body.Store(string(body))
+			writeAnthropicTextTurn(w, "Security check complete.")
+		default:
+			t.Fatalf("unexpected turn")
+		}
+	}))
+	t.Cleanup(mockLLM.Close)
+
+	cfg := DefaultConfig()
+	cfg.Model.Endpoint = mockLLM.URL
+	cfg.Sandbox.Mode = "native"
+	cfg.Sandbox.RedactSecrets = true
+
+	router, err := NewModelRouter(cfg.Model, "router-only-key", mockLLM.Client())
+	if err != nil {
+		t.Fatalf("NewModelRouter() error = %v", err)
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	loop, err := NewAgentLoop(AgentLoopConfig{
+		Workspace: ws,
+		Config:    cfg,
+		Manifest:  DefaultManifest(),
+		Store:     st,
+		Router:    router,
+		Out:       &outBuf,
+		ErrOut:    &errBuf,
+	})
+	if err != nil {
+		t.Fatalf("NewAgentLoop() error = %v", err)
+	}
+
+	if _, err := loop.Run(ctx, "Verify sandbox and secret redaction."); err != nil {
+		t.Fatalf("loop.Run() error = %v", err)
+	}
+
+	payload, _ := turn2Body.Load().(string)
+	if payload == "" {
+		t.Fatalf("did not capture turn 2 LLM payload")
+	}
+
+	// 1. EgressProxy HTTP_PROXY must be injected into the sandboxed bash process.
+	if !strings.Contains(payload, "PROXY=http://127.0.0.1:") {
+		t.Fatalf("expected injected local EgressProxy URL in sandbox output:\n%s", payload)
+	}
+	// 2. Host ANTHROPIC_API_KEY must be stripped from the sandboxed child environment.
+	if strings.Contains(payload, hostSecret) {
+		t.Fatalf("host ANTHROPIC_API_KEY leaked into sandbox / LLM payload:\n%s", payload)
+	}
+	// 3. Repo .env secret and SSH private key marker must be scrubbed before leaving ModelRouter.
+	if strings.Contains(payload, dotEnvSecret) {
+		t.Fatalf(".env secret leaked in outbound LLM payload:\n%s", payload)
+	}
+	if strings.Contains(payload, "-----BEGIN OPENSSH PRIVATE KEY-----") {
+		t.Fatalf("SSH private key header leaked in outbound LLM payload:\n%s", payload)
+	}
+	if !strings.Contains(payload, "[REDACTED:known_env_value]") || !strings.Contains(payload, "[REDACTED:ssh_private_key]") {
+		t.Fatalf("expected redaction markers in outbound LLM payload:\n%s", payload)
+	}
 }

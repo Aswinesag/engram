@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"engram/internal/mcp"
+	"engram/internal/proxy"
 )
 
 const defaultHTTPTimeout = 5 * time.Minute
@@ -69,9 +70,11 @@ type StreamDeltaHandler func(textDelta string)
 // ModelRouter communicates directly over net/http with Anthropic, OpenAI, and Ollama
 // using raw SSE and NDJSON streaming parsers (zero external orchestration wrappers).
 type ModelRouter struct {
-	cfg        ModelConfig
-	apiKey     string
-	httpClient *http.Client
+	cfg              ModelConfig
+	apiKey           string
+	httpClient       *http.Client
+	scrubber         *proxy.Scrubber
+	onSecretScrubbed func([]proxy.Finding)
 }
 
 // NewModelRouter constructs a ModelRouter from .engram/config.toml model settings.
@@ -105,8 +108,28 @@ func NewModelRouter(cfg ModelConfig, apiKeyOverride string, httpClient *http.Cli
 	}, nil
 }
 
+// SetScrubber attaches an automatic secret scanner/redactor that scrubs outbound
+// LLM prompts, conversation history, and tool results before transmission.
+func (r *ModelRouter) SetScrubber(s *proxy.Scrubber) {
+	r.scrubber = s
+}
+
+// SetSecretScrubHandler registers an optional callback invoked whenever outbound
+// LLM payload secrets are redacted.
+func (r *ModelRouter) SetSecretScrubHandler(fn func([]proxy.Finding)) {
+	r.onSecretScrubbed = fn
+}
+
 // StreamChat dispatches req to the configured provider and streams its response.
 func (r *ModelRouter) StreamChat(ctx context.Context, req ChatRequest, onDelta StreamDeltaHandler) (ChatResponse, error) {
+	if r.scrubber != nil {
+		var findings []proxy.Finding
+		req, findings = scrubChatRequest(req, r.scrubber)
+		if len(findings) > 0 && r.onSecretScrubbed != nil {
+			r.onSecretScrubbed(findings)
+		}
+	}
+
 	switch r.cfg.Provider {
 	case "anthropic":
 		return r.streamAnthropic(ctx, req, onDelta)
@@ -116,6 +139,97 @@ func (r *ModelRouter) StreamChat(ctx context.Context, req ChatRequest, onDelta S
 		return r.streamOllama(ctx, req, onDelta)
 	default:
 		return ChatResponse{}, fmt.Errorf("control: unsupported provider %q", r.cfg.Provider)
+	}
+}
+
+func scrubChatRequest(req ChatRequest, scrubber *proxy.Scrubber) (ChatRequest, []proxy.Finding) {
+	var allFindings []proxy.Finding
+
+	if req.SystemPrompt != "" {
+		res := scrubber.Scrub(req.SystemPrompt)
+		if !res.Clean {
+			req.SystemPrompt = res.Redacted
+			allFindings = append(allFindings, res.Findings...)
+		}
+	}
+
+	if len(req.Messages) > 0 {
+		msgs := make([]Message, len(req.Messages))
+		for i, m := range req.Messages {
+			if m.Content != "" {
+				res := scrubber.Scrub(m.Content)
+				if !res.Clean {
+					m.Content = res.Redacted
+					allFindings = append(allFindings, res.Findings...)
+				}
+			}
+			if len(m.ToolCalls) > 0 {
+				tcs := make([]ToolCall, len(m.ToolCalls))
+				for j, tc := range m.ToolCalls {
+					if len(bytes.TrimSpace(tc.Input)) > 0 {
+						scrubbedRaw, findings := scrubJSONRaw(tc.Input, scrubber)
+						if len(findings) > 0 {
+							tc.Input = scrubbedRaw
+							allFindings = append(allFindings, findings...)
+						}
+					}
+					tcs[j] = tc
+				}
+				m.ToolCalls = tcs
+			}
+			msgs[i] = m
+		}
+		req.Messages = msgs
+	}
+
+	return req, allFindings
+}
+
+func scrubJSONRaw(raw json.RawMessage, scrubber *proxy.Scrubber) (json.RawMessage, []proxy.Finding) {
+	var parsed any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		res := scrubber.Scrub(string(raw))
+		if res.Clean {
+			return raw, nil
+		}
+		return json.RawMessage(res.Redacted), res.Findings
+	}
+
+	var findings []proxy.Finding
+	cleaned := scrubJSONValue(parsed, scrubber, &findings)
+	if len(findings) == 0 {
+		return raw, nil
+	}
+	b, err := json.Marshal(cleaned)
+	if err != nil {
+		return raw, findings
+	}
+	return json.RawMessage(b), findings
+}
+
+func scrubJSONValue(v any, scrubber *proxy.Scrubber, findings *[]proxy.Finding) any {
+	switch val := v.(type) {
+	case string:
+		res := scrubber.Scrub(val)
+		if !res.Clean {
+			*findings = append(*findings, res.Findings...)
+			return res.Redacted
+		}
+		return val
+	case []any:
+		out := make([]any, len(val))
+		for i, elem := range val {
+			out[i] = scrubJSONValue(elem, scrubber, findings)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, elem := range val {
+			out[k] = scrubJSONValue(elem, scrubber, findings)
+		}
+		return out
+	default:
+		return v
 	}
 }
 

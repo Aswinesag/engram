@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"engram/internal/sandbox"
 	"errors"
 	"os"
 	"os/exec"
@@ -236,4 +237,46 @@ func findTestPython() (string, error) {
 		return p, nil
 	}
 	return "", errors.New("python not found")
+}
+
+type stubSandboxRunner struct {
+	lastReq sandbox.ExecRequest
+	result  sandbox.ExecResult
+}
+
+func (s *stubSandboxRunner) Backend() string { return "stub-sandbox" }
+
+func (s *stubSandboxRunner) Run(_ context.Context, req sandbox.ExecRequest) (sandbox.ExecResult, error) {
+	s.lastReq = req
+	return s.result, nil
+}
+
+func TestHostBashUsesInjectedSandboxRunner(t *testing.T) {
+	ctx := context.Background()
+	wtDir := t.TempDir()
+
+	stub := &stubSandboxRunner{
+		result: sandbox.ExecResult{
+			Output:   "sandboxed-output",
+			ExitCode: 0,
+			Backend:  "stub-sandbox",
+		},
+	}
+
+	host, err := NewHostWithOptions(ctx, wtDir, HostOptions{CommandRunner: stub})
+	if err != nil {
+		t.Fatalf("NewHostWithOptions() error = %v", err)
+	}
+	t.Cleanup(func() { _ = host.Close() })
+
+	res, err := host.CallTool(ctx, "bash", json.RawMessage(`{"command":"pytest -q","timeout_seconds":12}`))
+	if err != nil {
+		t.Fatalf("CallTool(bash) error = %v", err)
+	}
+	if res.IsError || res.Output != "sandboxed-output" {
+		t.Fatalf("bash result = %+v, want sandboxed-output", res)
+	}
+	if stub.lastReq.Command != "pytest -q" || stub.lastReq.Timeout.Seconds() != 12 {
+		t.Fatalf("sandbox runner received unexpected req = %+v", stub.lastReq)
+	}
 }

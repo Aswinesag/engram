@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"engram/internal/mcp"
+	"engram/internal/proxy"
+	"engram/internal/sandbox"
 	"engram/internal/store"
 	"engram/internal/worktree"
 )
@@ -23,19 +26,22 @@ var (
 	ErrMaxStepsExceeded = errors.New("control: agent session exceeded maximum step limit")
 )
 
-// AgentLoopConfig wires all Phase 1 deterministic runtime subsystems together.
+// AgentLoopConfig wires all deterministic runtime, sandbox, and proxy subsystems together.
 type AgentLoopConfig struct {
-	Workspace    Workspace
-	Config       Config
-	Manifest     Manifest
-	Store        *store.Store
-	Router       *ModelRouter
-	WorktreeMgr  *worktree.Manager
-	PythonBin    string
-	MaxSteps     int
-	SystemPrompt string
-	Out          io.Writer
-	ErrOut       io.Writer
+	Workspace     Workspace
+	Config        Config
+	Manifest      Manifest
+	Store         *store.Store
+	Router        *ModelRouter
+	WorktreeMgr   *worktree.Manager
+	SandboxRunner sandbox.Runner     // Optional override; defaults to Config.Sandbox.Mode
+	EgressProxy   *proxy.EgressProxy // Optional override; defaults to per-session local proxy
+	Scrubber      *proxy.Scrubber    // Optional override; defaults to .env-aware Scrubber when RedactSecrets=true
+	PythonBin     string
+	MaxSteps      int
+	SystemPrompt  string
+	Out           io.Writer
+	ErrOut        io.Writer
 }
 
 // AgentRunResult summarizes a completed or terminated session.
@@ -91,14 +97,82 @@ func NewAgentLoop(cfg AgentLoopConfig) (*AgentLoop, error) {
 	}, nil
 }
 
-// Run executes taskPrompt inside an isolated detached Git worktree, recording atomic
-// step commits, applying deterministic pre/post Python hooks, and enforcing context hygiene.
+// Run executes taskPrompt inside an isolated detached Git worktree with a
+// per-session domain-allowlisted egress proxy, dual-mode command sandboxing,
+// automatic secret scrubbing, deterministic Python hooks, and strict context hygiene.
 func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRunResult, runErr error) {
 	taskPrompt = strings.TrimSpace(taskPrompt)
 	if taskPrompt == "" {
 		return AgentRunResult{}, errors.New("control: taskPrompt must not be empty")
 	}
 
+	// 1. Configure secret scrubber (including repo .env values) and attach to ModelRouter.
+	scrubber, err := a.buildScrubber()
+	if err != nil {
+		return AgentRunResult{}, err
+	}
+	if scrubber != nil {
+		a.cfg.Router.SetScrubber(scrubber)
+		a.cfg.Router.SetSecretScrubHandler(func(findings []proxy.Finding) {
+			if a.cfg.ErrOut == nil {
+				return
+			}
+			rules := make([]string, 0, len(findings))
+			for _, f := range findings {
+				rules = append(rules, f.Rule)
+			}
+			fmt.Fprintf(a.cfg.ErrOut, "[security] redacted %d secret(s) from outbound LLM payload (%s)\n",
+				len(findings), strings.Join(rules, ", "))
+		})
+	}
+
+	// 2. Start per-session HTTP/SOCKS5 egress proxy enforcing config.toml allowed_domains.
+	egressProxy := a.cfg.EgressProxy
+	ownsProxy := false
+	if egressProxy == nil {
+		var err error
+		egressProxy, err = proxy.NewEgressProxy(proxy.ProxyConfig{
+			AllowedDomains: a.cfg.Config.Sandbox.AllowedDomains,
+			Scrubber:       scrubber,
+			SecretAction:   proxy.SecretActionBlock,
+			OnEvent: func(ev proxy.AuditEvent) {
+				if !ev.Allowed && a.cfg.ErrOut != nil {
+					fmt.Fprintf(a.cfg.ErrOut, "[egress-proxy] blocked %s -> %s (%s)\n",
+						ev.Protocol, ev.Target, ev.Reason)
+				}
+			},
+		})
+		if err != nil {
+			return AgentRunResult{}, err
+		}
+		if err := egressProxy.Start(ctx); err != nil {
+			return AgentRunResult{}, err
+		}
+		ownsProxy = true
+	}
+	if ownsProxy {
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = egressProxy.Close(closeCtx)
+		}()
+	}
+
+	// 3. Provision dual-mode sandbox runner routed through the local egress proxy.
+	sandboxRunner := a.cfg.SandboxRunner
+	if sandboxRunner == nil {
+		var err error
+		sandboxRunner, err = sandbox.NewRunner(sandbox.Config{
+			Mode:           sandbox.Mode(a.cfg.Config.Sandbox.Mode),
+			ContainerImage: a.cfg.Config.Sandbox.ContainerImage,
+			ProxyEnv:       egressProxy.ProxyEnv(),
+		})
+		if err != nil {
+			return AgentRunResult{}, err
+		}
+	}
+
+	// 4. Provision detached Git worktree (Invariant #1: Zero Host Filesystem Mutation).
 	sessionID := newID("sess")
 	sessWT, err := a.cfg.WorktreeMgr.Create(ctx, sessionID, "")
 	if err != nil {
@@ -133,7 +207,9 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 		_ = a.cfg.Store.UpdateSessionStatus(updateCtx, sessionID, finalStatus)
 	}()
 
-	host, err := mcp.NewHost(ctx, sessWT.WorktreePath)
+	host, err := mcp.NewHostWithOptions(ctx, sessWT.WorktreePath, mcp.HostOptions{
+		CommandRunner: sandboxRunner,
+	})
 	if err != nil {
 		return result, err
 	}
@@ -185,14 +261,12 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 		}
 		turnDurationMS := time.Since(turnStart).Milliseconds()
 
-		// Record assistant turn in conversation history.
 		messages = append(messages, Message{
 			Role:      RoleAssistant,
 			Content:   resp.Content,
 			ToolCalls: resp.ToolCalls,
 		})
 
-		// If no tool calls were requested, record the final reasoning step and finish.
 		if len(resp.ToolCalls) == 0 {
 			stepIndex++
 			headSHA, err := a.cfg.WorktreeMgr.HeadSHA(ctx, sessWT.WorktreePath)
@@ -234,8 +308,6 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 				tokensOut int64
 				thought   string
 			)
-			// Attribute LLM turn tokens and thought to the first tool step of the turn
-			// so session token sums remain exact.
 			if callIdx == 0 {
 				tokensIn = resp.TokensIn
 				tokensOut = resp.TokensOut
@@ -298,7 +370,7 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 				continue
 			}
 
-			// 2. Execute Tool via MCP Host inside the isolated worktree.
+			// 2. Execute Tool via Sandboxed MCP Host inside the isolated worktree.
 			toolRes, callErr := host.CallTool(ctx, tc.Name, tc.Input)
 			rawOutput := toolRes.Output
 			exitCode := toolRes.ExitCode
@@ -333,7 +405,7 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 				rawOutput = strings.TrimSpace(rawOutput + "\n[post-hook " + postDecision.BlockedBy + "]: " + postDecision.Guidance)
 			}
 
-			// 4. Atomic Step Shadow Commit (only commits when worktree files actually changed).
+			// 4. Atomic Step Shadow Commit.
 			var headSHA string
 			if mutatesFiles {
 				shadow, err := a.cfg.WorktreeMgr.CommitStep(ctx, sessWT.WorktreePath, stepIndex,
@@ -399,6 +471,27 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 	return result, ErrMaxStepsExceeded
 }
 
+func (a *AgentLoop) buildScrubber() (*proxy.Scrubber, error) {
+	if a.cfg.Scrubber != nil {
+		return a.cfg.Scrubber, nil
+	}
+	if !a.cfg.Config.Sandbox.RedactSecrets {
+		return nil, nil
+	}
+
+	var dotEnvSecrets []string
+	envPath := filepath.Join(a.cfg.Workspace.RepoRoot, ".env")
+	if secrets, err := proxy.LoadDotEnvSecrets(envPath); err == nil {
+		dotEnvSecrets = append(dotEnvSecrets, secrets...)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	return proxy.NewScrubber(proxy.ScrubberConfig{
+		AdditionalSecrets: dotEnvSecrets,
+	}), nil
+}
+
 func (a *AgentLoop) mountActiveTools(ctx context.Context, host *mcp.Host) error {
 	activeTools, err := a.cfg.Store.ListEngrams(ctx, store.EngramFilter{
 		Status: store.EngramStatusActive,
@@ -446,6 +539,3 @@ func newID(prefix string) string {
 	}
 	return fmt.Sprintf("%s_%x_%s", prefix, time.Now().UTC().UnixMilli(), hex.EncodeToString(b[:]))
 }
-
-// Unused import guard for filepath when needed by callers.
-var _ = filepath.Clean
