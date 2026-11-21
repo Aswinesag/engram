@@ -1,12 +1,12 @@
-"""AST-validated synthesis engine for Engram hooks, composite MCP tools, and scoped rules."""
+"""AST-validated synthesis engine for Python hooks, MCP stdio tools, and scoped rules."""
 
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import tomllib
@@ -14,682 +14,735 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable
 
-from engram_compiler.detector import FrictionEvent, PatternType
+from engram_compiler.detector import (
+    PATTERN_CIRCULAR_FILE_EDIT,
+    PATTERN_MULTI_STEP_COMMAND,
+    PATTERN_REPEATED_TOOL_ERROR,
+    FrictionEvent,
+)
 
-EngramKind = Literal["hook", "tool", "rule"]
+KIND_HOOK = "hook"
+KIND_TOOL = "tool"
+KIND_RULE = "rule"
 
-_DISALLOWED_BUILTINS = frozenset({"eval", "exec", "compile", "__import__", "breakpoint"})
+VALID_KINDS = {KIND_HOOK, KIND_TOOL, KIND_RULE}
+FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__"}
 
+_PORT_RE = re.compile(r"\bport\s+(\d{2,5})\b", re.IGNORECASE)
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
+
+# Strict JSON Schema enforced on structured LLM synthesis responses.
 SYNTHESIS_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": [
-        "kind",
-        "target_tool",
-        "trigger_pattern",
-        "file_slug",
-        "explanation",
-    ],
+    "required": ["kind", "slug", "target_tool", "trigger_pattern", "explanation", "content"],
     "properties": {
-        "kind": {"type": "string", "enum": ["hook", "tool", "rule"]},
+        "kind": {"type": "string", "enum": [KIND_HOOK, KIND_TOOL, KIND_RULE]},
+        "slug": {"type": "string", "pattern": "^[a-z0-9_]{3,40}$"},
         "target_tool": {"type": "string"},
-        "trigger_pattern": {"type": "string"},
-        "file_slug": {"type": "string", "pattern": "^[a-z0-9_]{3,48}$"},
-        "code": {"type": "string"},
-        "rule_markdown": {"type": "string"},
-        "globs": {"type": "array", "items": {"type": "string"}},
-        "explanation": {"type": "string"},
+        "trigger_pattern": {"type": "string", "minLength": 1},
+        "explanation": {"type": "string", "minLength": 10},
+        "content": {"type": "string", "minLength": 20},
     },
 }
 
 
-class ASTValidationError(ValueError):
-    """Raised when synthesized Python code fails syntax, stdlib-only, or contract checks."""
-
-
 class SynthesisError(RuntimeError):
-    """Raised when synthesis cannot produce a valid engram artifact."""
+    """Raised when engram synthesis or AST/schema validation fails."""
 
 
-@dataclass(frozen=True, slots=True)
-class SynthesizedEngram:
-    """Generated, AST-validated (for Python) candidate engram ready for shadow replay."""
+@dataclass(frozen=True)
+class ModelSettings:
+    """Direct LLM settings parsed from .engram/config.toml."""
 
-    engram_id: str
-    kind: EngramKind
-    target_tool: str
-    trigger_pattern: str
-    file_path: str  # Repo-relative path, e.g. ".engram/hooks/eng_...py"
-    content: str
-    explanation: str
-    failure_signature: str
-    ast_validated: bool
-    globs: tuple[str, ...] = field(default_factory=tuple)
-
-    def write_to_repo(self, repo_root: str | Path) -> Path:
-        """Persist the synthesized artifact safely inside <repo_root>/.engram/."""
-        root = Path(repo_root).resolve()
-        engram_dir = (root / ".engram").resolve()
-        dest = (root / self.file_path).resolve()
-        if not dest.is_relative_to(engram_dir):
-            raise SynthesisError(f"Refusing to write artifact outside .engram/: {dest}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(self.content, encoding="utf-8")
-        return dest
-
-
-class StructuredLLMClient(Protocol):
-    """Minimal protocol for direct structured JSON LLM generation (zero frameworks)."""
-
-    def generate_json(self, system_prompt: str, user_prompt: str, schema: dict[str, Any]) -> dict[str, Any]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class DirectModelConfig:
-    provider: str
-    model: str
-    endpoint: str
-    api_key_env: str = ""
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-4-20250514"
+    endpoint: str = "https://api.anthropic.com/v1/messages"
+    api_key_env: str = "ANTHROPIC_API_KEY"
     max_output_tokens: int = 4096
 
     @classmethod
-    def from_workspace(cls, repo_root: str | Path) -> DirectModelConfig | None:
+    def from_repo(cls, repo_root: str | Path) -> ModelSettings:
         cfg_path = Path(repo_root) / ".engram" / "config.toml"
-        if not cfg_path.exists():
-            return None
-        data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
-        model_cfg = data.get("model", {})
-        provider = str(model_cfg.get("provider", "")).strip()
-        model = str(model_cfg.get("model", "")).strip()
-        endpoint = str(model_cfg.get("endpoint", "")).strip()
-        if not provider or not model or not endpoint:
-            return None
+        if not cfg_path.is_file():
+            return cls()
+        with cfg_path.open("rb") as f:
+            data = tomllib.load(f)
+        m = data.get("model", {})
         return cls(
-            provider=provider,
-            model=model,
-            endpoint=endpoint,
-            api_key_env=str(model_cfg.get("api_key_env", "")).strip(),
-            max_output_tokens=int(model_cfg.get("max_output_tokens", 4096)),
+            provider=str(m.get("provider", "anthropic")),
+            model=str(m.get("model", "claude-sonnet-4-20250514")),
+            endpoint=str(m.get("endpoint", "https://api.anthropic.com/v1/messages")),
+            api_key_env=str(m.get("api_key_env", "ANTHROPIC_API_KEY")),
+            max_output_tokens=int(m.get("max_output_tokens", 4096)),
         )
 
 
-class DirectHTTPJSONClient:
-    """Direct stdlib urllib client speaking Anthropic, OpenAI, and Ollama JSON APIs."""
+@dataclass(frozen=True)
+class SynthesizedArtifact:
+    """Validated candidate harness artifact prior to shadow verification."""
 
-    def __init__(self, cfg: DirectModelConfig, api_key: str = "", timeout_seconds: float = 60.0) -> None:
-        self.cfg = cfg
-        self.api_key = api_key.strip() or (os.environ.get(cfg.api_key_env, "").strip() if cfg.api_key_env else "")
-        self.timeout_seconds = timeout_seconds
-
-    def is_configured(self) -> bool:
-        if self.cfg.provider == "ollama":
-            return bool(self.cfg.endpoint and self.cfg.model)
-        if self.api_key:
-            return True
-        return "127.0.0.1" in self.cfg.endpoint or "localhost" in self.cfg.endpoint
-
-    def generate_json(self, system_prompt: str, user_prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
-        schema_prompt = (
-            f"{system_prompt}\n\n"
-            f"Respond ONLY with a valid JSON object conforming strictly to this JSON Schema:\n"
-            f"{json.dumps(schema, separators=(',', ':'))}"
-        )
-
-        if self.cfg.provider == "anthropic":
-            raw_text = self._call_anthropic(schema_prompt, user_prompt)
-        elif self.cfg.provider == "openai":
-            raw_text = self._call_openai(schema_prompt, user_prompt, schema)
-        elif self.cfg.provider == "ollama":
-            raw_text = self._call_ollama(schema_prompt, user_prompt)
-        else:
-            raise SynthesisError(f"Unsupported model provider: {self.cfg.provider}")
-
-        return extract_json_object(raw_text)
-
-    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> str:
-        headers = {
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
-        payload = {
-            "model": self.cfg.model,
-            "max_tokens": self.cfg.max_output_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-        resp = self._post_json(self.cfg.endpoint, headers, payload)
-        blocks = resp.get("content", [])
-        parts = [str(b.get("text", "")) for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
-        return "\n".join(parts)
-
-    def _call_openai(self, system_prompt: str, user_prompt: str, schema: dict[str, Any]) -> str:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        payload = {
-            "model": self.cfg.model,
-            "max_tokens": self.cfg.max_output_tokens,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "engram_synthesis",
-                    "strict": False,
-                    "schema": schema,
-                },
-            },
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        resp = self._post_json(self.cfg.endpoint, headers, payload)
-        choices = resp.get("choices", [])
-        if not choices:
-            raise SynthesisError("OpenAI response contained no choices")
-        return str(choices[0].get("message", {}).get("content", ""))
-
-    def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        payload = {
-            "model": self.cfg.model,
-            "stream": False,
-            "format": "json",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        resp = self._post_json(self.cfg.endpoint, headers, payload)
-        return str(resp.get("message", {}).get("content", ""))
-
-    def _post_json(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            err_body = exc.read().decode("utf-8", errors="replace")[:500]
-            raise SynthesisError(f"LLM HTTP {exc.code}: {err_body}") from exc
-        except urllib.error.URLError as exc:
-            raise SynthesisError(f"LLM request failed: {exc.reason}") from exc
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise SynthesisError(f"LLM returned invalid JSON envelope: {exc}") from exc
-        if not isinstance(parsed, dict):
-            raise SynthesisError("LLM response JSON envelope must be an object")
-        return parsed
+    engram_id: str
+    kind: str
+    target_tool: str
+    trigger_pattern: str
+    file_path: str  # Relative to repo root, e.g. ".engram/hooks/eng_...py"
+    failure_signature: str
+    explanation: str
+    content: str
+    ast_validated: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def validate_python_ast(code: str, *, kind: EngramKind) -> ast.Module:
-    """Parse and validate synthesized Python code using Python's built-in ast module.
+LLMTransport = Callable[[ModelSettings, str, str], str]
 
-    Enforces:
-    1. Valid Python 3.12 syntax via ast.parse()
-    2. Zero third-party imports (only Python standard library modules allowed)
-    3. No dynamic code execution builtins (eval, exec, compile, __import__)
-    4. Required structural contract per kind ('hook' or 'tool')
+
+def new_engram_id() -> str:
+    """Generate a unique eng_<millis_hex><rand> identifier."""
+    ts = int(time.time() * 1000)
+    rand_hex = secrets.token_hex(3).upper()
+    return f"eng_{ts:X}{rand_hex}"
+
+
+def sanitize_slug(raw: str, fallback: str = "compiled_engram") -> str:
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", (raw or "").lower()).strip("_")
+    if len(cleaned) < 3:
+        cleaned = fallback
+    return cleaned[:40].strip("_") or fallback
+
+
+def validate_python_artifact(source: str, kind: str) -> list[str]:
+    """Validate Python source via ast.parse() and static zero-dependency safety rules.
+
+    Returns a list of validation errors (empty means valid).
     """
-    if not code or not code.strip():
-        raise ASTValidationError("Synthesized Python code is empty")
+    if kind not in {KIND_HOOK, KIND_TOOL}:
+        return [f"unsupported python artifact kind: {kind!r}"]
+    if not (source or "").strip():
+        return ["generated Python source is empty"]
 
     try:
-        tree = ast.parse(code)
+        tree = ast.parse(source)
     except SyntaxError as exc:
-        raise ASTValidationError(f"SyntaxError at line {exc.lineno}: {exc.msg}") from exc
+        return [f"SyntaxError at line {exc.lineno}: {exc.msg}"]
 
-    stdlib_modules = sys.stdlib_module_names
+    errors: list[str] = []
+    stdlib = sys.stdlib_module_names
     imported_modules: set[str] = set()
-    called_names: set[str] = set()
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root_pkg = alias.name.split(".", 1)[0]
-                imported_modules.add(root_pkg)
-                if root_pkg not in stdlib_modules:
-                    raise ASTValidationError(
-                        f"Non-stdlib import '{alias.name}' prohibited in self-contained engrams"
-                    )
+                root_mod = alias.name.split(".", 1)[0]
+                imported_modules.add(root_mod)
+                if root_mod not in stdlib:
+                    errors.append(f"non-stdlib import not allowed: {alias.name!r}")
         elif isinstance(node, ast.ImportFrom):
-            if node.level and node.level > 0:
-                raise ASTValidationError("Relative imports are prohibited in self-contained engrams")
-            if node.module:
-                root_pkg = node.module.split(".", 1)[0]
-                imported_modules.add(root_pkg)
-                if root_pkg not in stdlib_modules:
-                    raise ASTValidationError(
-                        f"Non-stdlib import '{node.module}' prohibited in self-contained engrams"
-                    )
+            if node.level > 0:
+                errors.append("relative imports are not allowed in self-contained artifacts")
+            elif node.module:
+                root_mod = node.module.split(".", 1)[0]
+                imported_modules.add(root_mod)
+                if root_mod not in stdlib:
+                    errors.append(f"non-stdlib import not allowed: {node.module!r}")
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                called_names.add(node.func.id)
-                if node.func.id in _DISALLOWED_BUILTINS:
-                    raise ASTValidationError(f"Prohibited dynamic execution call '{node.func.id}()'")
-            elif isinstance(node.func, ast.Attribute):
-                called_names.add(node.func.attr)
+            if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
+                errors.append(f"forbidden dynamic execution call: {node.func.id}()")
 
-    if kind == "hook":
-        _validate_hook_contract(tree, code)
-    elif kind == "tool":
-        _validate_mcp_tool_contract(code)
+    if kind == KIND_HOOK:
+        has_exit = _contains_sys_exit(tree)
+        if not has_exit:
+            errors.append("hook must explicitly invoke sys.exit(...) or raise SystemExit")
+        if "sys" not in imported_modules:
+            errors.append("hook must import sys")
 
-    return tree
+    if kind == KIND_TOOL:
+        for required_rpc in ("initialize", "tools/list", "tools/call"):
+            if required_rpc not in source:
+                errors.append(f"MCP tool server missing JSON-RPC handler for {required_rpc!r}")
 
-
-def _validate_hook_contract(tree: ast.Module, code: str) -> None:
-    has_exit_call = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "exit":
-                has_exit_call = True
-            elif isinstance(node.func, ast.Name) and node.func.id == "exit":
-                has_exit_call = True
-        elif isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
-            if isinstance(node.exc.func, ast.Name) and node.exc.func.id == "SystemExit":
-                has_exit_call = True
-    if not has_exit_call:
-        raise ASTValidationError("Hook script must explicitly exit (e.g. sys.exit(0) / sys.exit(2))")
-    if "2" not in code:
-        raise ASTValidationError("Hook script must handle deterministic blocking via exit code 2")
+    return errors
 
 
-def _validate_mcp_tool_contract(code: str) -> None:
-    for required_method in ("initialize", "tools/list", "tools/call"):
-        if required_method not in code:
-            raise ASTValidationError(f"MCP tool script must implement JSON-RPC method '{required_method}'")
+def validate_rule_markdown(content: str) -> list[str]:
+    """Validate that a glob-scoped Markdown rule has YAML globs frontmatter and body."""
+    text = (content or "").lstrip()
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return ["Markdown rule must begin with YAML frontmatter ('--- ... ---')"]
+    frontmatter, body = match.group(1), match.group(2)
+    if "globs:" not in frontmatter:
+        return ["Markdown rule frontmatter must declare 'globs:'"]
+    if not re.search(r"globs:\s*\[.+\]", frontmatter, re.DOTALL) and not re.search(
+        r"globs:\s*\n\s*-\s+\S+", frontmatter
+    ):
+        return ["Markdown rule 'globs:' must specify at least one file glob pattern"]
+    if len(body.strip()) < 10:
+        return ["Markdown rule body must contain actionable guidance"]
+    return []
+
+
+def materialize_artifact(base_dir: str | Path, artifact: SynthesizedArtifact) -> Path:
+    """Write a validated artifact into <base_dir>/.engram/{hooks,tools,rules}/ safely."""
+    root = Path(base_dir).resolve()
+    rel = Path(artifact.file_path)
+    if rel.is_absolute():
+        raise SynthesisError(f"artifact file_path must be relative: {artifact.file_path!r}")
+
+    expected_subdir = {
+        KIND_HOOK: "hooks",
+        KIND_TOOL: "tools",
+        KIND_RULE: "rules",
+    }.get(artifact.kind)
+    if expected_subdir is None:
+        raise SynthesisError(f"unsupported artifact kind: {artifact.kind!r}")
+
+    allowed_parent = (root / ".engram" / expected_subdir).resolve()
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(allowed_parent)
+    except ValueError as exc:
+        raise SynthesisError(
+            f"unsafe artifact path {target} outside {allowed_parent}"
+        ) from exc
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(artifact.content, encoding="utf-8")
+    return target
 
 
 class Synthesizer:
-    """Compiles FrictionEvents into AST-validated Python hooks/tools or scoped Markdown rules."""
+    """Compiles FrictionEvents into AST-validated hooks, MCP tools, or glob-scoped rules."""
 
-    def __init__(self, llm_client: StructuredLLMClient | None = None) -> None:
-        self.llm_client = llm_client
+    def __init__(
+        self,
+        *,
+        llm_transport: LLMTransport | None = None,
+        allow_deterministic_fallback: bool = True,
+    ) -> None:
+        self._llm_transport = llm_transport
+        self._allow_fallback = allow_deterministic_fallback
 
     def synthesize(
         self,
         *,
         repo_root: str | Path,
-        friction_events: list[FrictionEvent],
+        event: FrictionEvent,
         engram_id: str | None = None,
-    ) -> SynthesizedEngram:
-        if not friction_events:
-            raise SynthesisError("At least one friction event is required for synthesis")
+    ) -> SynthesizedArtifact:
+        """Synthesize and AST-validate an engram resolving the given FrictionEvent."""
+        eid = engram_id or new_engram_id()
+        settings = ModelSettings.from_repo(repo_root)
 
-        primary = friction_events[0]
-        repo = Path(repo_root).resolve()
-        eid = engram_id or new_engram_id(primary.failure_signature)
+        api_key = os.environ.get(settings.api_key_env, "").strip()
+        can_call_llm = self._llm_transport is not None or bool(api_key) or settings.provider == "ollama"
 
-        repo_context = collect_repo_hints(repo, primary)
-
-        # 1. Try LLM structured synthesis if configured, validating via ast.parse().
-        if self.llm_client is not None:
+        if can_call_llm:
             try:
-                return self._synthesize_with_llm(eid, primary, repo_context)
-            except (SynthesisError, ASTValidationError):
-                # Fall back to deterministic synthesis when LLM output fails schema/AST validation.
-                pass
+                return self._synthesize_via_llm(
+                    repo_root=repo_root,
+                    settings=settings,
+                    event=event,
+                    engram_id=eid,
+                )
+            except SynthesisError:
+                if not self._allow_fallback:
+                    raise
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                if not self._allow_fallback:
+                    raise
 
-        # 2. Deterministic AST-validated synthesis fallback (works offline & in tests).
-        return self._synthesize_deterministic(eid, primary, repo_context)
+        if not self._allow_fallback:
+            raise SynthesisError("LLM synthesis unavailable and deterministic fallback disabled")
 
-    def _synthesize_with_llm(
+        return self._synthesize_deterministic(
+            repo_root=repo_root,
+            event=event,
+            engram_id=eid,
+        )
+
+    def _synthesize_via_llm(
         self,
-        engram_id: str,
+        *,
+        repo_root: str | Path,
+        settings: ModelSettings,
         event: FrictionEvent,
-        repo_context: dict[str, Any],
-    ) -> SynthesizedEngram:
-        assert self.llm_client is not None
-        system_prompt = (
-            "You are the Engram Evolution Compiler. Convert the execution friction trace into a "
-            "deterministic, zero-dependency, self-contained Python 3.12+ pre/post hook, a stdio MCP "
-            "tool, or a glob-scoped Markdown rule. Python code MUST use only standard library modules "
-            "and MUST NOT use eval/exec/compile/__import__. Hooks read JSON from sys.stdin and exit "
-            "0 (allow) or exit 2 with actionable stdout guidance (block)."
-        )
-        user_prompt = json.dumps(
-            {
-                "friction_event": event.to_ipc_dict(),
-                "command": event.command,
-                "target_path": event.target_path,
-                "error_excerpt": event.error_excerpt,
-                "repo_hints": repo_context,
-            },
-            indent=2,
-        )
-
-        raw = self.llm_client.generate_json(system_prompt, user_prompt, SYNTHESIS_JSON_SCHEMA)
-        return self._materialize_structured_payload(engram_id, event, raw)
-
-    def _materialize_structured_payload(
-        self,
         engram_id: str,
-        event: FrictionEvent,
-        data: dict[str, Any],
-    ) -> SynthesizedEngram:
-        kind = str(data.get("kind", "")).strip()
-        if kind not in ("hook", "tool", "rule"):
-            raise SynthesisError(f"Invalid engram kind: {kind!r}")
+    ) -> SynthesizedArtifact:
+        transport = self._llm_transport or _default_llm_transport
+        repo_context = _collect_repo_hints(repo_root)
+        system_prompt = _build_system_prompt()
+        user_prompt = _build_user_prompt(event, repo_context)
 
-        slug = sanitize_slug(str(data.get("file_slug", "auto_fix")))
-        target_tool = str(data.get("target_tool", event.tool_name or "bash")).strip()
-        trigger_pattern = str(data.get("trigger_pattern", "")).strip()
-        explanation = str(data.get("explanation", "")).strip() or event.summary
+        last_err = ""
+        for attempt in range(2):
+            prompt = user_prompt
+            if attempt > 0 and last_err:
+                prompt += f"\n\nPrevious output failed validation with:\n{last_err}\nFix all errors and output valid JSON matching the schema."
 
-        if kind in ("hook", "tool"):
-            code = str(data.get("code", ""))
-            validate_python_ast(code, kind=kind)
-            if kind == "hook":
-                if not trigger_pattern:
-                    trigger_pattern = build_command_regex(event.command)
-                re.compile(trigger_pattern)
-                file_path = f".engram/hooks/{engram_id}_{slug}.py"
-            else:
-                if not trigger_pattern:
-                    trigger_pattern = slug
-                file_path = f".engram/tools/{engram_id}_{slug}.py"
+            raw_json = transport(settings, system_prompt, prompt)
+            try:
+                spec = _parse_structured_spec(raw_json)
+                return self._build_and_validate_artifact(
+                    spec=spec,
+                    engram_id=engram_id,
+                    failure_signature=event.failure_signature,
+                )
+            except SynthesisError as exc:
+                last_err = str(exc)
 
-            return SynthesizedEngram(
-                engram_id=engram_id,
-                kind=kind,
-                target_tool=target_tool,
-                trigger_pattern=trigger_pattern,
-                file_path=file_path,
-                content=code.rstrip() + "\n",
-                explanation=explanation,
-                failure_signature=event.failure_signature,
-                ast_validated=True,
-            )
-
-        # kind == "rule"
-        globs_raw = data.get("globs") or ([event.target_path] if event.target_path else ["**/*"])
-        globs = tuple(str(g).strip() for g in globs_raw if str(g).strip())
-        if not trigger_pattern:
-            trigger_pattern = globs[0]
-        body = str(data.get("rule_markdown", "")).strip()
-        if not body:
-            raise SynthesisError("Synthesized rule_markdown must not be empty")
-        markdown = format_scoped_rule_markdown(engram_id, globs, event.failure_signature, body)
-        file_path = f".engram/rules/{engram_id}_{slug}.md"
-
-        return SynthesizedEngram(
-            engram_id=engram_id,
-            kind="rule",
-            target_tool=target_tool,
-            trigger_pattern=trigger_pattern,
-            file_path=file_path,
-            content=markdown,
-            explanation=explanation,
-            failure_signature=event.failure_signature,
-            ast_validated=False,
-            globs=globs,
-        )
+        raise SynthesisError(f"LLM synthesis failed AST/schema validation after retries: {last_err}")
 
     def _synthesize_deterministic(
         self,
-        engram_id: str,
+        *,
+        repo_root: str | Path,
         event: FrictionEvent,
-        repo_context: dict[str, Any],
-    ) -> SynthesizedEngram:
-        if event.pattern == PatternType.CIRCULAR_FILE_EDIT:
-            target = event.target_path or "**/*"
-            slug = sanitize_slug(f"guard_{Path(target).stem}")
-            body = (
-                f"# Avoid Circular Edits on `{target}`\n\n"
-                f"Previous steps repeatedly rewrote `{target}` without converging.\n"
-                f"1. Read the full file and its test expectations before editing.\n"
-                f"2. Verify incremental changes with targeted tests instead of oscillating edits.\n"
-            )
-            markdown = format_scoped_rule_markdown(engram_id, (target,), event.failure_signature, body)
-            return SynthesizedEngram(
-                engram_id=engram_id,
-                kind="rule",
-                target_tool=event.tool_name or "write_file",
-                trigger_pattern=target,
-                file_path=f".engram/rules/{engram_id}_{slug}.md",
-                content=markdown,
-                explanation=f"Injects targeted guidance whenever {target} is modified to prevent circular rewrites.",
-                failure_signature=event.failure_signature,
-                ast_validated=False,
-                globs=(target,),
-            )
-
-        # Synthesize a deterministic pre-tool Python hook for repeated bash/tool failures.
-        cmd_regex = build_command_regex(event.command)
-        port = extract_port_hint(event.error_excerpt or event.summary)
-        compose_files = repo_context.get("compose_files", [])
-
-        if port is not None:
-            compose_hint = (
-                f"docker compose -f {compose_files[0]} up -d"
-                if compose_files
-                else f"Start the local service listening on port {port}"
-            )
-            slug = "verify_service_port"
-            code = _render_tcp_port_hook(port=port, compose_hint=compose_hint)
-            explanation = (
-                f"Verifies TCP service is accepting connections on 127.0.0.1:{port} before running "
-                f"matching command; outputs actionable startup instructions on exit code 2."
-            )
-        elif "modulenotfounderror" in (event.error_excerpt + event.summary).lower() or "no module named" in (
-            event.error_excerpt + event.summary
-        ).lower():
-            slug = "verify_python_env"
-            code = _render_venv_hook()
-            explanation = (
-                "Checks that a project virtual environment or configured test runner exists before "
-                "executing Python test commands; blocks with setup instructions on exit code 2."
-            )
+        engram_id: str,
+    ) -> SynthesizedArtifact:
+        if event.pattern == PATTERN_CIRCULAR_FILE_EDIT:
+            spec = _compile_circular_edit_rule(event)
+        elif event.pattern == PATTERN_MULTI_STEP_COMMAND and len(event.command_sequence) >= 2:
+            spec = _compile_composite_mcp_tool(event)
         else:
-            slug = sanitize_slug(f"guard_{command_head_token(event.command)}")
-            code = _render_preflight_hook(
-                command_regex=cmd_regex,
-                error_excerpt=event.error_excerpt or event.summary,
-                compose_files=compose_files,
-            )
-            explanation = (
-                f"Deterministic pre-tool guard for '{event.command or event.tool_name}' preventing "
-                f"repeated failure ({event.error_excerpt or event.pattern})."
-            )
+            spec = _compile_pre_tool_hook(repo_root, event)
 
-        validate_python_ast(code, kind="hook")
-        return SynthesizedEngram(
+        return self._build_and_validate_artifact(
+            spec=spec,
             engram_id=engram_id,
-            kind="hook",
-            target_tool=event.tool_name or "bash",
-            trigger_pattern=cmd_regex,
-            file_path=f".engram/hooks/{engram_id}_{slug}.py",
-            content=code,
-            explanation=explanation,
             failure_signature=event.failure_signature,
+        )
+
+    def _build_and_validate_artifact(
+        self,
+        *,
+        spec: dict[str, Any],
+        engram_id: str,
+        failure_signature: str,
+    ) -> SynthesizedArtifact:
+        kind = str(spec.get("kind", "")).strip()
+        if kind not in VALID_KINDS:
+            raise SynthesisError(f"invalid engram kind: {kind!r}")
+
+        slug = sanitize_slug(str(spec.get("slug", "")))
+        target_tool = str(spec.get("target_tool", "")).strip()
+        trigger_pattern = str(spec.get("trigger_pattern", "")).strip()
+        explanation = str(spec.get("explanation", "")).strip()
+        content = str(spec.get("content", ""))
+
+        if not trigger_pattern:
+            raise SynthesisError("trigger_pattern must not be empty")
+        if len(explanation) < 5:
+            raise SynthesisError("explanation must not be empty")
+
+        if kind in {KIND_HOOK, KIND_TOOL}:
+            errs = validate_python_artifact(content, kind)
+            if errs:
+                raise SynthesisError("; ".join(errs))
+            try:
+                re.compile(trigger_pattern)
+            except re.error as exc:
+                raise SynthesisError(f"invalid trigger regex {trigger_pattern!r}: {exc}") from exc
+            subdir = "hooks" if kind == KIND_HOOK else "tools"
+            ext = ".py"
+        else:
+            errs = validate_rule_markdown(content)
+            if errs:
+                raise SynthesisError("; ".join(errs))
+            subdir = "rules"
+            ext = ".md"
+
+        rel_path = f".engram/{subdir}/{engram_id}_{slug}{ext}"
+        return SynthesizedArtifact(
+            engram_id=engram_id,
+            kind=kind,
+            target_tool=target_tool,
+            trigger_pattern=trigger_pattern,
+            file_path=rel_path,
+            failure_signature=failure_signature,
+            explanation=explanation,
+            content=content,
             ast_validated=True,
         )
 
 
-def _render_tcp_port_hook(*, port: int, compose_hint: str) -> str:
-    return (
-        f'"""Auto-synthesized Engram hook: verify TCP service port {port} before execution."""\n\n'
-        "import json\n"
-        "import socket\n"
-        "import sys\n\n"
-        f"TARGET_HOST = \"127.0.0.1\"\n"
-        f"TARGET_PORT = {port}\n"
-        f"STARTUP_HINT = {json.dumps(compose_hint)}\n\n\n"
-        "def main() -> None:\n"
-        "    try:\n"
-        "        json.load(sys.stdin)\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    try:\n"
-        "        with socket.create_connection((TARGET_HOST, TARGET_PORT), timeout=1.5):\n"
-        "            sys.exit(0)\n"
-        "    except OSError as exc:\n"
-        "        print(\n"
-        f'            f"Dependency service is not reachable on {{TARGET_HOST}}:{{TARGET_PORT}} ({{exc}}). "\n'
-        '            f"Start it first with: {STARTUP_HINT}"\n'
-        "        )\n"
-        "        sys.exit(2)\n\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
+def _contains_sys_exit(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            if isinstance(node.exc.func, ast.Name) and node.exc.func.id == "SystemExit":
+                return True
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Attribute) and fn.attr == "exit":
+                if isinstance(fn.value, ast.Name) and fn.value.id == "sys":
+                    return True
+    return False
+
+
+def _parse_structured_spec(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SynthesisError(f"invalid JSON structured output: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SynthesisError("structured output must be a JSON object")
+    for req_key in ("kind", "slug", "trigger_pattern", "explanation", "content"):
+        if req_key not in parsed:
+            raise SynthesisError(f"structured output missing required key {req_key!r}")
+    return parsed
+
+
+def _compile_pre_tool_hook(repo_root: str | Path, event: FrictionEvent) -> dict[str, Any]:
+    cmd = event.command_sample or ""
+    err_text = f"{event.error_sample} {event.summary}"
+
+    # 1. TCP port / connection refused prerequisite (e.g. Postgres 5432, Redis 6379).
+    port_match = _PORT_RE.search(err_text)
+    if port_match or "connectionrefused" in err_text.lower() or "econnrefused" in err_text.lower():
+        port = int(port_match.group(1)) if port_match else 5432
+        cmd_head = (cmd.split()[0] if cmd.split() else "pytest")
+        cmd_regex = f"^{re.escape(cmd_head)}\\b"
+        compose_hint = _find_compose_hint(repo_root)
+        guidance = (
+            f"Service on localhost:{port} is not accepting connections. "
+            f"Start dependencies first (e.g. {compose_hint}) before running '{cmd_head}'."
+        )
+        script = f'''"""Deterministic Engram pre-tool hook: verify localhost:{port} is reachable."""
+
+import json
+import socket
+import sys
+
+
+def main() -> int:
+    _payload = json.load(sys.stdin)
+    try:
+        with socket.create_connection(("127.0.0.1", {port}), timeout=1.5):
+            return 0
+    except OSError as exc:
+        print({guidance!r} + f" (error: {{exc}})")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+        return {
+            "kind": KIND_HOOK,
+            "slug": f"verify_port_{port}",
+            "target_tool": event.tool_name or "bash",
+            "trigger_pattern": cmd_regex,
+            "explanation": f"Verifies localhost:{port} is accepting connections before running {cmd_head}; exits with code 2 and startup instructions if unreachable.",
+            "content": script,
+        }
+
+    # 2. Missing file/marker/binary prerequisite.
+    cmd_head = (cmd.split()[0] if cmd.split() else event.tool_name or "bash")
+    cmd_regex = f"^{re.escape(cmd_head)}\\b" if cmd else ".*"
+    guidance = (
+        f"Blocked repeated failing command '{cmd or cmd_head}'. "
+        f"Previous attempts failed with: {event.error_sample or event.summary}. "
+        f"Resolve the missing prerequisite before retrying."
     )
+    script = f'''"""Deterministic Engram pre-tool hook: guard repeated failing command."""
+
+import json
+import shutil
+import sys
 
 
-def _render_venv_hook() -> str:
-    return (
-        '"""Auto-synthesized Engram hook: verify local Python virtual environment before running tests."""\n\n'
-        "import json\n"
-        "import os\n"
-        "import shutil\n"
-        "import sys\n\n\n"
-        "def main() -> None:\n"
-        "    try:\n"
-        "        json.load(sys.stdin)\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    cwd = os.getcwd()\n"
-        "    has_venv = any(\n"
-        '        os.path.isdir(os.path.join(cwd, name)) for name in (".venv", "venv")\n'
-        "    )\n"
-        '    if has_venv or os.environ.get("VIRTUAL_ENV") or shutil.which("pytest"):\n'
-        "        sys.exit(0)\n"
-        "    print(\n"
-        '        "Python test dependencies are missing in this environment. "\n'
-        '        "Activate .venv or install project dependencies (e.g., uv sync) before running pytest."\n'
-        "    )\n"
-        "    sys.exit(2)\n\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
-    )
+def main() -> int:
+    payload = json.load(sys.stdin)
+    tool_input = payload.get("tool_input") or {{}}
+    cmd = str(tool_input.get("command") or tool_input.get("cmd") or "").strip()
+    if not cmd:
+        return 0
+    head = cmd.split()[0]
+    if shutil.which(head) is None:
+        print(f"Required executable '{{head}}' not found in PATH. " + {guidance!r})
+        return 2
+    print({guidance!r})
+    return 2
 
 
-def _render_preflight_hook(*, command_regex: str, error_excerpt: str, compose_files: list[str]) -> str:
-    hint = (
-        f"Check prerequisites (found compose file: {compose_files[0]}) before retrying."
-        if compose_files
-        else "Inspect repository prerequisites before retrying this command."
-    )
-    return (
-        '"""Auto-synthesized Engram pre-tool failure guard."""\n\n'
-        "import json\n"
-        "import os\n"
-        "import sys\n\n"
-        f"MATCH_REGEX = {json.dumps(command_regex)}\n"
-        f"PREVIOUS_ERROR = {json.dumps(error_excerpt)}\n"
-        f"GUIDANCE = {json.dumps(hint)}\n\n\n"
-        "def main() -> None:\n"
-        "    try:\n"
-        "        payload = json.load(sys.stdin)\n"
-        "    except Exception:\n"
-        "        payload = {}\n"
-        '    cwd = payload.get("worktree_path") or os.getcwd()\n'
-        '    ready_marker = os.path.join(cwd, ".engram_preflight_ok")\n'
-        "    if os.path.exists(ready_marker):\n"
-        "        sys.exit(0)\n"
-        '    print(f"Blocked repeated failure pattern ({MATCH_REGEX}): {PREVIOUS_ERROR}. {GUIDANCE}")\n'
-        "    sys.exit(2)\n\n\n"
-        'if __name__ == "__main__":\n'
-        "    main()\n"
-    )
-
-
-def collect_repo_hints(repo_root: Path, event: FrictionEvent) -> dict[str, Any]:
-    compose_files: list[str] = []
-    for name in ("docker-compose.test.yml", "docker-compose.yml", "compose.yml", "compose.yaml"):
-        if (repo_root / name).exists():
-            compose_files.append(name)
-
+if __name__ == "__main__":
+    sys.exit(main())
+'''
     return {
-        "compose_files": compose_files,
-        "has_pyproject": (repo_root / "pyproject.toml").exists(),
-        "has_package_json": (repo_root / "package.json").exists(),
-        "has_go_mod": (repo_root / "go.mod").exists(),
-        "target_path_exists": bool(event.target_path and (repo_root / event.target_path).exists()),
+        "kind": KIND_HOOK,
+        "slug": sanitize_slug(f"guard_{cmd_head}", "guard_command"),
+        "target_tool": event.tool_name or "bash",
+        "trigger_pattern": cmd_regex,
+        "explanation": f"Guards '{cmd_head}' invocations after repeated tool failures and provides deterministic remediation guidance on exit code 2.",
+        "content": script,
     }
 
 
-def extract_port_hint(text: str) -> int | None:
-    patterns = (
-        re.compile(r"\bport\s+(\d{2,5})\b", re.IGNORECASE),
-        re.compile(r"(?:127\.0\.0\.1|localhost):(\d{2,5})\b"),
-    )
-    for pat in patterns:
-        m = pat.search(text)
-        if m:
-            port = int(m.group(1))
-            if 1 <= port <= 65535:
-                return port
-    return None
+def _compile_composite_mcp_tool(event: FrictionEvent) -> dict[str, Any]:
+    seq = list(event.command_sequence)
+    tool_fn_name = sanitize_slug(f"workflow_{seq[0].split()[0]}", "composite_workflow")
+    commands_literal = repr(seq)
+    script = f'''"""Synthesized MCP-compatible stdio JSON-RPC 2.0 composite tool."""
+
+import json
+import os
+import subprocess
+import sys
+
+COMMANDS = {commands_literal}
+TOOL_NAME = {tool_fn_name!r}
 
 
-def command_head_token(command: str) -> str:
-    tokens = command.strip().split()
-    if not tokens:
-        return "command"
-    return Path(tokens[0]).stem or "command"
+def run_sequence(worktree_path: str) -> tuple[bool, str]:
+    outputs = []
+    for cmd in COMMANDS:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        outputs.append(f"$ {{cmd}} (exit={{proc.returncode}})\\n{{combined.strip()}}")
+        if proc.returncode != 0:
+            return True, "\\n\\n".join(outputs)
+    return False, "\\n\\n".join(outputs)
 
 
-def build_command_regex(command: str) -> str:
-    tokens = command.strip().split()
-    if not tokens:
-        return ".*"
-    head = re.escape(tokens[0])
-    return rf"^{head}\b"
+def main() -> int:
+    for line in sys.stdin:
+        raw = line.strip()
+        if not raw:
+            continue
+        msg = json.loads(raw)
+        msg_id = msg.get("id")
+        method = msg.get("method")
+        if msg_id is None:
+            continue
+
+        if method == "initialize":
+            resp = {{
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {{
+                    "protocolVersion": msg.get("params", {{}}).get("protocolVersion", "2024-11-05"),
+                    "capabilities": {{"tools": {{}}}},
+                    "serverInfo": {{"name": TOOL_NAME, "version": "1.0.0"}},
+                }},
+            }}
+        elif method == "tools/list":
+            resp = {{
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {{
+                    "tools": [
+                        {{
+                            "name": TOOL_NAME,
+                            "description": "Execute verified multi-step workflow atomically inside the isolated worktree.",
+                            "inputSchema": {{"type": "object", "properties": {{}}}},
+                        }}
+                    ]
+                }},
+            }}
+        elif method == "tools/call":
+            wt = os.environ.get("ENGRAM_WORKTREE_PATH") or os.getcwd()
+            is_err, text = run_sequence(wt)
+            resp = {{
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {{
+                    "content": [{{"type": "text", "text": text}}],
+                    "isError": is_err,
+                }},
+            }}
+        else:
+            resp = {{
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {{"code": -32601, "message": f"unknown method {{method}}"}},
+            }}
+
+        sys.stdout.write(json.dumps(resp) + "\\n")
+        sys.stdout.flush()
+    return 0
 
 
-def sanitize_slug(raw: str) -> str:
-    slug = re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_")
-    return slug[:48] or "engram_artifact"
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+    return {
+        "kind": KIND_TOOL,
+        "slug": tool_fn_name,
+        "target_tool": tool_fn_name,
+        "trigger_pattern": f"^{re.escape(tool_fn_name)}$",
+        "explanation": f"Replaces fragile {len(seq)}-step bash sequence with a single deterministic MCP stdio tool.",
+        "content": script,
+    }
 
 
-def new_engram_id(seed: str) -> str:
-    raw = f"{time.time_ns()}:{seed}".encode("utf-8")
-    digest = hashlib.sha256(raw).hexdigest()[:8].upper()
-    return f"eng_{digest}"
-
-
-def format_scoped_rule_markdown(
-    engram_id: str,
-    globs: tuple[str, ...],
-    failure_signature: str,
-    body: str,
-) -> str:
-    globs_json = json.dumps(list(globs))
-    return (
-        "---\n"
-        f"id: {engram_id}\n"
+def _compile_circular_edit_rule(event: FrictionEvent) -> dict[str, Any]:
+    paths = event.target_paths or ["**/*"]
+    globs_json = json.dumps(paths)
+    primary = paths[0]
+    slug = sanitize_slug(Path(primary).stem, "scoped_edit_rule")
+    content = (
+        f"---\n"
         f"globs: {globs_json}\n"
-        f"failure_signature: {json.dumps(failure_signature)}\n"
-        "---\n\n"
-        f"{body.strip()}\n"
+        f"---\n\n"
+        f"# Scoped Guidance for `{primary}`\n\n"
+        f"Previous agent steps entered a circular edit loop on `{primary}` "
+        f"(steps {event.step_range[0]}..{event.step_range[1]}).\n\n"
+        f"- Read the full target file and related tests before applying another edit.\n"
+        f"- Run targeted verification immediately after each edit instead of rewriting repeatedly.\n"
+    )
+    return {
+        "kind": KIND_RULE,
+        "slug": slug,
+        "target_tool": event.tool_name or "write_file",
+        "trigger_pattern": paths[0],
+        "explanation": f"Glob-scoped rule injected when editing {primary} to prevent circular edits.",
+        "content": content,
+    }
+
+
+def _find_compose_hint(repo_root: str | Path) -> str:
+    root = Path(repo_root)
+    for name in ("docker-compose.test.yml", "docker-compose.yml", "compose.yml"):
+        if (root / name).is_file():
+            return f"docker compose -f {name} up -d"
+    return "docker compose up -d"
+
+
+def _collect_repo_hints(repo_root: str | Path) -> str:
+    root = Path(repo_root)
+    if not root.is_dir():
+        return ""
+    interesting = []
+    for entry in sorted(root.iterdir()):
+        if entry.name.startswith(".engram") or entry.name == ".git":
+            continue
+        if entry.name in {
+            "pyproject.toml",
+            "package.json",
+            "go.mod",
+            "Makefile",
+            "docker-compose.yml",
+            "docker-compose.test.yml",
+            "compose.yml",
+        }:
+            interesting.append(entry.name)
+    return ", ".join(interesting)
+
+
+def _build_system_prompt() -> str:
+    return (
+        "You are Engram's Evolution Compiler. Convert execution friction into a deterministic, "
+        "self-contained, zero-dependency Python 3.12+ hook script (exit 0=allow, exit 2=block with guidance), "
+        "an MCP stdio JSON-RPC 2.0 tool, or a glob-scoped Markdown rule.\n"
+        "Strict rules:\n"
+        "- Use ONLY Python standard library modules (zero third-party imports).\n"
+        "- Never use eval(), exec(), compile(), or __import__().\n"
+        "- Hooks must read JSON from sys.stdin and call sys.exit(0) or sys.exit(2).\n"
+        "Respond with a single JSON object matching the required schema."
     )
 
 
-def extract_json_object(raw_text: str) -> dict[str, Any]:
-    text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3:
-            text = "\n".join(lines[1:-1]).strip()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            raise SynthesisError("LLM output did not contain a JSON object")
-        try:
-            parsed = json.loads(text[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise SynthesisError(f"Failed to parse extracted JSON object: {exc}") from exc
+def _build_user_prompt(event: FrictionEvent, repo_hints: str) -> str:
+    return json.dumps(
+        {
+            "friction_event": event.to_dict(),
+            "repo_files": repo_hints,
+            "schema": SYNTHESIS_JSON_SCHEMA,
+        },
+        indent=2,
+    )
 
-    if not isinstance(parsed, dict):
-        raise SynthesisError("Extracted JSON payload must be an object")
-    return parsed
+
+def _default_llm_transport(settings: ModelSettings, system_prompt: str, user_prompt: str) -> str:
+    api_key = os.environ.get(settings.api_key_env, "").strip()
+    headers = {"Content-Type": "application/json"}
+
+    if settings.provider == "anthropic":
+        if api_key:
+            headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+        body = {
+            "model": settings.model,
+            "max_tokens": settings.max_output_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "tools": [
+                {
+                    "name": "emit_engram",
+                    "description": "Emit the synthesized engram specification.",
+                    "input_schema": SYNTHESIS_JSON_SCHEMA,
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "emit_engram"},
+        }
+        data = _post_json(settings.endpoint, headers, body)
+        for block in data.get("content", []):
+            if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                return json.dumps(block["input"])
+            if block.get("type") == "text":
+                return str(block.get("text", ""))
+        raise SynthesisError("Anthropic response did not contain structured tool_use output")
+
+    if settings.provider == "openai":
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        body = {
+            "model": settings.model,
+            "max_tokens": settings.max_output_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "engram_synthesis",
+                    "strict": True,
+                    "schema": SYNTHESIS_JSON_SCHEMA,
+                },
+            },
+        }
+        data = _post_json(settings.endpoint, headers, body)
+        choices = data.get("choices") or []
+        if not choices:
+            raise SynthesisError("OpenAI response returned no choices")
+        return str(choices[0].get("message", {}).get("content", ""))
+
+    if settings.provider == "ollama":
+        body = {
+            "model": settings.model,
+            "stream": False,
+            "format": SYNTHESIS_JSON_SCHEMA,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        data = _post_json(settings.endpoint, headers, body)
+        return str(data.get("message", {}).get("content", ""))
+
+    raise SynthesisError(f"unsupported provider {settings.provider!r}")
+
+
+def _post_json(endpoint: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))

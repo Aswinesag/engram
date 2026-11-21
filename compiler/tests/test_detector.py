@@ -7,235 +7,192 @@ import unittest
 from pathlib import Path
 
 from engram_compiler.detector import (
-    FrictionDetector,
-    PatternType,
+    PATTERN_CIRCULAR_FILE_EDIT,
+    PATTERN_MULTI_STEP_COMMAND,
+    PATTERN_REPEATED_TOOL_ERROR,
+    FrictionEvent,
     StepRecord,
-    normalize_failure_text,
+    analyze_session,
+    detect_friction,
+    merge_friction_events,
+    normalize_failure_signature,
 )
 
-REPO_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "internal" / "store" / "schema.sql"
 
-
-class FrictionDetectorTests(unittest.TestCase):
-    def test_detects_repeated_tool_error_and_normalizes_signature(self) -> None:
-        detector = FrictionDetector(repeated_error_threshold=3)
-
-        steps = [
-            StepRecord(
-                id="s1",
-                session_id="sess_01",
-                step_index=1,
-                git_commit_sha="aaa111",
-                tool_name="read_file",
-                tool_input_json='{"path":"tests/api/test_users.py"}',
-                exit_code=0,
-            ),
-            StepRecord(
-                id="s4",
-                session_id="sess_01",
-                step_index=4,
-                git_commit_sha="aaa111",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest tests/api"}',
-                tool_output_summary="exit_code=1\nConnectionRefusedError: [Errno 111] Connection refused on port 5432 at 2026-11-21T10:00:01Z",
-                exit_code=1,
-            ),
-            StepRecord(
-                id="s5",
-                session_id="sess_01",
-                step_index=5,
-                git_commit_sha="aaa111",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest tests/api"}',
-                tool_output_summary="exit_code=1\nConnectionRefusedError: [Errno 111] Connection refused on port 5432 at 2026-11-21T10:00:04Z",
-                exit_code=1,
-            ),
-            StepRecord(
-                id="s6",
-                session_id="sess_01",
-                step_index=6,
-                git_commit_sha="aaa111",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest tests/api"}',
-                tool_output_summary="exit_code=1\nConnectionRefusedError: [Errno 111] Connection refused on port 5432 at 2026-11-21T10:00:09Z",
-                exit_code=1,
-            ),
-        ]
-
-        events = detector.analyze_steps(steps)
-        self.assertEqual(len(events), 1)
-        ev = events[0]
-        self.assertEqual(ev.pattern, PatternType.REPEATED_TOOL_ERROR)
-        self.assertEqual(ev.step_range, (4, 6))
-        self.assertEqual(ev.tool_name, "bash")
-        self.assertEqual(ev.command, "pytest tests/api")
-        self.assertIn("ConnectionRefusedError", ev.summary)
-
-        ipc = ev.to_ipc_dict()
-        self.assertEqual(set(ipc.keys()), {"step_range", "pattern", "tool_name", "summary"})
-        self.assertEqual(ipc["step_range"], [4, 6])
-        self.assertEqual(ipc["pattern"], "REPEATED_TOOL_ERROR")
-
-        # Normalization must produce identical signatures across different timestamps/paths.
-        sig_a = normalize_failure_text(
-            "ConnectionRefusedError: line 42 in /tmp/wt_a/test.py at 2026-11-21T10:00:01Z"
+def _create_test_db(db_path: Path, session_id: str, steps: list[StepRecord]) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                task_prompt TEXT NOT NULL,
+                base_commit_sha TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE steps (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                step_index INTEGER NOT NULL,
+                git_commit_sha TEXT NOT NULL,
+                thought TEXT,
+                tool_name TEXT,
+                tool_input_json TEXT,
+                tool_output_summary TEXT,
+                raw_artifact_path TEXT,
+                exit_code INTEGER,
+                duration_ms INTEGER,
+                tokens_in INTEGER,
+                tokens_out INTEGER
+            );
+            """
         )
-        sig_b = normalize_failure_text(
-            "ConnectionRefusedError: line 99 in /tmp/wt_b/test.py at 2026-11-21T11:22:33Z"
+        conn.execute(
+            "INSERT INTO sessions (id, task_prompt, base_commit_sha, worktree_path, status) VALUES (?, ?, ?, ?, ?)",
+            (session_id, "Run API tests", "a1b2c3d4", "/tmp/wt", "failed"),
         )
-        self.assertEqual(sig_a, sig_b)
-
-    def test_detects_circular_file_edit_with_oscillation(self) -> None:
-        detector = FrictionDetector(circular_edit_threshold=3)
-
-        steps = [
-            StepRecord(
-                id="s1",
-                session_id="sess_02",
-                step_index=1,
-                git_commit_sha="sha1",
-                tool_name="write_file",
-                tool_input_json=json.dumps({"path": "src/api/routes.py", "content": "async def f(): return 1\n"}),
-                exit_code=0,
-            ),
-            StepRecord(
-                id="s2",
-                session_id="sess_02",
-                step_index=2,
-                git_commit_sha="sha2",
-                tool_name="write_file",
-                tool_input_json=json.dumps({"path": "src/api/routes.py", "content": "def f(): return 2\n"}),
-                exit_code=0,
-            ),
-            StepRecord(
-                id="s3",
-                session_id="sess_02",
-                step_index=3,
-                git_commit_sha="sha3",
-                tool_name="write_file",
-                tool_input_json=json.dumps({"path": "src/api/routes.py", "content": "async def f(): return 1\n"}),
-                exit_code=0,
-            ),
-        ]
-
-        events = detector.analyze_steps(steps)
-        self.assertEqual(len(events), 1)
-        ev = events[0]
-        self.assertEqual(ev.pattern, PatternType.CIRCULAR_FILE_EDIT)
-        self.assertEqual(ev.target_path, "src/api/routes.py")
-        self.assertEqual(ev.step_range, (1, 3))
-        self.assertTrue(ev.metadata["oscillated"])
-
-    def test_detects_multi_step_retry_loop(self) -> None:
-        detector = FrictionDetector(repeated_error_threshold=3, circular_edit_threshold=3, retry_cycle_threshold=2)
-
-        steps = [
-            StepRecord(
-                id="s1",
-                session_id="sess_03",
-                step_index=1,
-                git_commit_sha="sha1",
-                tool_name="write_file",
-                tool_input_json='{"path":"app/db.py","content":"v1"}',
-                exit_code=0,
-            ),
-            StepRecord(
-                id="s2",
-                session_id="sess_03",
-                step_index=2,
-                git_commit_sha="sha1",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest tests/test_db.py"}',
-                tool_output_summary="AssertionError: expected 200 got 500",
-                exit_code=1,
-            ),
-            StepRecord(
-                id="s3",
-                session_id="sess_03",
-                step_index=3,
-                git_commit_sha="sha2",
-                tool_name="write_file",
-                tool_input_json='{"path":"app/db.py","content":"v2"}',
-                exit_code=0,
-            ),
-            StepRecord(
-                id="s4",
-                session_id="sess_03",
-                step_index=4,
-                git_commit_sha="sha2",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest tests/test_db.py"}',
-                tool_output_summary="AssertionError: expected 200 got 500",
-                exit_code=1,
-            ),
-        ]
-
-        events = detector.analyze_steps(steps)
-        patterns = {e.pattern for e in events}
-        self.assertIn(PatternType.MULTI_STEP_RETRY_LOOP, patterns)
-
-    def test_no_false_positives_on_transient_single_error(self) -> None:
-        detector = FrictionDetector()
-        steps = [
-            StepRecord(
-                id="s1",
-                session_id="sess_04",
-                step_index=1,
-                git_commit_sha="sha1",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest"}',
-                tool_output_summary="ModuleNotFoundError: foo",
-                exit_code=1,
-            ),
-            StepRecord(
-                id="s2",
-                session_id="sess_04",
-                step_index=2,
-                git_commit_sha="sha2",
-                tool_name="write_file",
-                tool_input_json='{"path":"foo.py","content":"x = 1"}',
-                exit_code=0,
-            ),
-            StepRecord(
-                id="s3",
-                session_id="sess_04",
-                step_index=3,
-                git_commit_sha="sha2",
-                tool_name="bash",
-                tool_input_json='{"command":"pytest"}',
-                tool_output_summary="5 passed",
-                exit_code=0,
-            ),
-        ]
-        self.assertEqual(detector.analyze_steps(steps), [])
-
-    def test_analyze_session_reads_sqlite_wal_database(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "state.db"
-            conn = sqlite3.connect(db_path)
-            conn.executescript(REPO_SCHEMA_PATH.read_text(encoding="utf-8"))
+        for s in steps:
             conn.execute(
                 """
-                INSERT INTO sessions (id, task_prompt, base_commit_sha, worktree_path, status)
-                VALUES ('sess_wal', 'Fix API tests', 'a1b2c3d4', '/tmp/wt', 'failed')
-                """
+                INSERT INTO steps (
+                    id, session_id, step_index, git_commit_sha, thought,
+                    tool_name, tool_input_json, tool_output_summary,
+                    raw_artifact_path, exit_code, duration_ms, tokens_in, tokens_out
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    s.id,
+                    s.session_id,
+                    s.step_index,
+                    s.git_commit_sha,
+                    s.thought,
+                    s.tool_name,
+                    s.tool_input_json,
+                    s.tool_output_summary,
+                    s.raw_artifact_path,
+                    s.exit_code,
+                    s.duration_ms,
+                    s.tokens_in,
+                    s.tokens_out,
+                ),
             )
-            for idx in range(1, 4):
-                conn.execute(
-                    """
-                    INSERT INTO steps (id, session_id, step_index, git_commit_sha, tool_name, tool_input_json, tool_output_summary, exit_code)
-                    VALUES (?, 'sess_wal', ?, 'a1b2c3d4', 'bash', '{"command":"pytest tests/api"}', 'ConnectionRefusedError: port 5432', 1)
-                    """,
-                    (f"st_{idx}", idx),
-                )
-            conn.commit()
-            conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
-            detector = FrictionDetector()
-            events = detector.analyze_session(db_path, "sess_wal")
+
+class DetectorTests(unittest.TestCase):
+    def test_analyze_session_detects_repeated_tool_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.db"
+            steps = [
+                StepRecord("s1", "sess_1", 1, "sha1", tool_name="read_file", tool_input_json='{"path":"README.md"}', exit_code=0),
+                StepRecord(
+                    "s2", "sess_1", 2, "sha1",
+                    tool_name="bash",
+                    tool_input_json='{"command":"pytest tests/api"}',
+                    tool_output_summary="psycopg.OperationalError: ConnectionRefusedError on port 5432",
+                    exit_code=1,
+                ),
+                StepRecord(
+                    "s3", "sess_1", 3, "sha1",
+                    tool_name="bash",
+                    tool_input_json='{"command":"pytest tests/api -k health"}',
+                    tool_output_summary="psycopg.OperationalError: ConnectionRefusedError on port 5432",
+                    exit_code=1,
+                ),
+                StepRecord(
+                    "s4", "sess_1", 4, "sha1",
+                    tool_name="bash",
+                    tool_input_json='{"command":"pytest tests/api"}',
+                    tool_output_summary="psycopg.OperationalError: ConnectionRefusedError on port 5432",
+                    exit_code=1,
+                ),
+            ]
+            _create_test_db(db_path, "sess_1", steps)
+
+            events = analyze_session(db_path, "sess_1")
             self.assertEqual(len(events), 1)
-            self.assertEqual(events[0].pattern, PatternType.REPEATED_TOOL_ERROR)
-            self.assertEqual(events[0].step_range, (1, 3))
+            ev = events[0]
+            self.assertEqual(ev.pattern, PATTERN_REPEATED_TOOL_ERROR)
+            self.assertEqual(ev.step_range, [2, 4])
+            self.assertEqual(ev.tool_name, "bash")
+            self.assertIn("ConnectionRefusedError", ev.error_sample)
+            self.assertEqual(ev.exit_codes, [1, 1, 1])
+
+            rpc = ev.to_rpc_dict()
+            self.assertEqual(set(rpc.keys()), {"step_range", "pattern", "tool_name", "summary"})
+
+    def test_detect_circular_file_edit_and_multi_step_command_patterns(self) -> None:
+        steps = [
+            StepRecord("1", "sess_2", 1, "sha", tool_name="write_file", tool_input_json='{"path":"src/api/routes.py","content":"a"}', exit_code=0),
+            StepRecord("2", "sess_2", 2, "sha", tool_name="bash", tool_input_json='{"command":"docker compose -f docker-compose.test.yml up -d db"}', exit_code=0),
+            StepRecord("3", "sess_2", 3, "sha", tool_name="bash", tool_input_json='{"command":"alembic upgrade head"}', exit_code=0),
+            StepRecord("4", "sess_2", 4, "sha", tool_name="write_file", tool_input_json='{"path":"src/api/routes.py","content":"b"}', exit_code=0),
+            StepRecord("5", "sess_2", 5, "sha", tool_name="bash", tool_input_json='{"command":"docker compose -f docker-compose.test.yml up -d db"}', exit_code=0),
+            StepRecord("6", "sess_2", 6, "sha", tool_name="bash", tool_input_json='{"command":"alembic upgrade head"}', exit_code=0),
+            StepRecord("7", "sess_2", 7, "sha", tool_name="write_file", tool_input_json='{"path":"src/api/routes.py","content":"c"}', exit_code=0),
+        ]
+
+        events = detect_friction(steps)
+        patterns = {e.pattern for e in events}
+        self.assertIn(PATTERN_CIRCULAR_FILE_EDIT, patterns)
+        self.assertIn(PATTERN_MULTI_STEP_COMMAND, patterns)
+
+        circular = next(e for e in events if e.pattern == PATTERN_CIRCULAR_FILE_EDIT)
+        self.assertEqual(circular.target_paths, ["src/api/routes.py"])
+        self.assertEqual(circular.step_range, [1, 7])
+
+        chain = next(e for e in events if e.pattern == PATTERN_MULTI_STEP_COMMAND)
+        self.assertEqual(
+            chain.command_sequence,
+            ["docker compose -f docker-compose.test.yml up -d db", "alembic upgrade head"],
+        )
+
+    def test_failure_signature_is_stable_across_volatile_tokens(self) -> None:
+        sig_tuesday = normalize_failure_signature(
+            PATTERN_REPEATED_TOOL_ERROR,
+            "bash",
+            "2026-11-17T10:15:00Z /repo/.engram/.runtime/worktrees/sess_abc/test.py:42 ConnectionRefusedError commit deadbeef12345678",
+        )
+        sig_wednesday = normalize_failure_signature(
+            PATTERN_REPEATED_TOOL_ERROR,
+            "bash",
+            "2026-11-18T09:02:11Z /repo/.engram/.runtime/worktrees/sess_xyz/test.py:99 ConnectionRefusedError commit cafe9876543210ab",
+        )
+        self.assertEqual(sig_tuesday, sig_wednesday)
+
+    def test_merge_friction_events_enriches_go_payload(self) -> None:
+        reported = [
+            {
+                "step_range": [4, 7],
+                "pattern": PATTERN_REPEATED_TOOL_ERROR,
+                "tool_name": "bash",
+                "summary": "Agent ran 'pytest tests/api' 3 times failing with ConnectionRefusedError on port 5432.",
+            }
+        ]
+        detected = [
+            FrictionEvent(
+                step_range=[4, 6],
+                pattern=PATTERN_REPEATED_TOOL_ERROR,
+                tool_name="bash",
+                summary="Detected 3 errors",
+                failure_signature="repeated_tool_error:bash:1234567890abcdef",
+                command_sample="pytest tests/api",
+                error_sample="ConnectionRefusedError on port 5432",
+                exit_codes=[1, 1, 1],
+            )
+        ]
+
+        merged = merge_friction_events(reported, detected)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].command_sample, "pytest tests/api")
+        self.assertEqual(merged[0].failure_signature, "repeated_tool_error:bash:1234567890abcdef")
+        # Ensure JSON serialization stays clean.
+        self.assertTrue(json.dumps(merged[0].to_rpc_dict()))
 
 
 if __name__ == "__main__":

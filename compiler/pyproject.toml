@@ -1,17 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "engram-compiler"
-version = "0.1.0"
-description = "Zero-framework Python 3.12+ Evolution Compiler & Shadow Evaluator for Engram"
+version = "1.0.0"
+description = "Self-evolving AST-validated harness compiler and shadow evaluator for Engram"
 requires-python = ">=3.12"
+# Invariant #2 (Zero Orchestration Frameworks): pure Python 3.12+ stdlib only.
 dependencies = []
 
 [project.scripts]
 engram-compiler = "engram_compiler.server:main"
 
-[build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+[tool.hatch.build.targets.wheel]
+packages = ["engram_compiler"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["engram_compiler*"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

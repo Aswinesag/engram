@@ -1,15 +1,3 @@
-"""Engram Evolution Compiler package (zero-framework Python 3.12+)."""
+"""Engram Evolution Compiler sidecar (Python 3.12+ stdlib-only)."""
 
-from engram_compiler.detector import (
-    FrictionDetector,
-    FrictionEvent,
-    PatternType,
-    StepRecord,
-)
-
-__all__ = [
-    "FrictionDetector",
-    "FrictionEvent",
-    "PatternType",
-    "StepRecord",
-]
+__version__ = "1.0.0"
