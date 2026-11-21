@@ -172,10 +172,10 @@ class UnixJSONRPCServer:
     """Cross-platform (Linux, macOS, Windows 10+) AF_UNIX newline-delimited JSON-RPC 2.0 server."""
 
     def __init__(self, socket_path: str | Path, service: EvolutionService | None = None) -> None:
-        if not hasattr(socket, "AF_UNIX"):
-            raise RuntimeError("This Python runtime does not support AF_UNIX sockets")
         self.socket_path = Path(socket_path)
         self.service = service or EvolutionService()
+        self._transport = "unix" if hasattr(socket, "AF_UNIX") else "tcp"
+        self.bound_address = str(self.socket_path)
         self._sock: socket.socket | None = None
         self._stop_event = threading.Event()
         self._bg_thread: threading.Thread | None = None
@@ -187,11 +187,29 @@ class UnixJSONRPCServer:
         if self.socket_path.exists():
             self.socket_path.unlink()
 
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(str(self.socket_path))
+        if self._transport == "unix":
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(str(self.socket_path))
+            sock.listen(32)
+            sock.settimeout(0.2)
+            self._sock = sock
+            self.bound_address = str(self.socket_path)
+            return
+
+        # Windows CPython lacks AF_UNIX; bind loopback 127.0.0.1:0 and atomically
+        # publish the tcp://127.0.0.1:<port> descriptor at socket_path.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
         sock.listen(32)
         sock.settimeout(0.2)
+        host, port = sock.getsockname()
         self._sock = sock
+        self.bound_address = f"tcp://{host}:{port}"
+
+        tmp_path = self.socket_path.with_suffix(".sock.tmp")
+        tmp_path.write_text(self.bound_address + "\n", encoding="utf-8")
+        os.replace(tmp_path, self.socket_path)
 
     def serve_forever(self) -> None:
         if self._sock is None:

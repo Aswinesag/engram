@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -180,10 +182,17 @@ func (c *Client) call(ctx context.Context, method string, params any, resultDest
 		defer cancel()
 	}
 
-	dialer := &net.Dialer{Timeout: c.dialTimeout}
-	conn, err := dialer.DialContext(callCtx, "unix", c.socketPath)
+	dialTimeout := c.dialTimeout
+	if deadline, ok := callCtx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 0 && rem < dialTimeout {
+			dialTimeout = rem
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	conn, err := dialEndpoint(callCtx, dialer, c.socketPath)
 	if err != nil {
-		return fmt.Errorf("ipc: dial unix socket %q: %w", c.socketPath, err)
+		return fmt.Errorf("ipc: dial compiler endpoint %q: %w", c.socketPath, err)
 	}
 	defer conn.Close()
 
@@ -230,15 +239,35 @@ func (c *Client) call(ctx context.Context, method string, params any, resultDest
 	return nil
 }
 
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // Sidecar manages a local Python Evolution Compiler background process.
 type Sidecar struct {
 	cmd        *exec.Cmd
 	socketPath string
 	client     *Client
+	doneCh     chan error
+	stderr     *syncBuffer
+	stopOnce   sync.Once
 }
 
 // StartSidecar launches `python -m engram_compiler.server --socket <socketPath>`
-// and waits until `compiler.ping` succeeds.
+// and waits until the socket is bound and `compiler.ping` succeeds.
 func StartSidecar(ctx context.Context, pythonBin, compilerDir, socketPath string) (*Sidecar, error) {
 	if strings.TrimSpace(pythonBin) == "" {
 		return nil, errors.New("ipc: pythonBin is required to start compiler sidecar")
@@ -246,6 +275,9 @@ func StartSidecar(ctx context.Context, pythonBin, compilerDir, socketPath string
 	if strings.TrimSpace(socketPath) == "" {
 		return nil, errors.New("ipc: socketPath is required to start compiler sidecar")
 	}
+
+	// Remove any stale socket file so os.Stat detects the newly bound listener cleanly.
+	_ = os.Remove(socketPath)
 
 	cmd := exec.Command(pythonBin, "-m", "engram_compiler.server", "--socket", socketPath)
 	env := append(os.Environ(), "PYTHONUNBUFFERED=1")
@@ -262,17 +294,26 @@ func StartSidecar(ctx context.Context, pythonBin, compilerDir, socketPath string
 	}
 	cmd.Env = env
 
+	stderrBuf := &syncBuffer{}
+	cmd.Stderr = stderrBuf
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("ipc: start compiler sidecar: %w", err)
 	}
+
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- cmd.Wait()
+	}()
 
 	sidecar := &Sidecar{
 		cmd:        cmd,
 		socketPath: socketPath,
 		client:     NewClient(socketPath, DefaultCallTimeout),
+		doneCh:     doneCh,
+		stderr:     stderrBuf,
 	}
 
-	// Poll compiler.ping until the UDS listener is ready or timeout expires.
 	waitCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
@@ -281,16 +322,35 @@ func StartSidecar(ctx context.Context, pythonBin, compilerDir, socketPath string
 
 	var lastErr error
 	for {
-		if _, err := sidecar.client.Ping(waitCtx); err == nil {
-			return sidecar, nil
+		select {
+		case exitErr := <-doneCh:
+			_ = os.Remove(socketPath)
+			return nil, fmt.Errorf("ipc: compiler sidecar exited early (%v): %s",
+				exitErr, strings.TrimSpace(stderrBuf.String()))
+		default:
+		}
+
+		if _, statErr := os.Stat(socketPath); statErr == nil {
+			pingCtx, pingCancel := context.WithTimeout(waitCtx, 500*time.Millisecond)
+			_, pingErr := sidecar.client.Ping(pingCtx)
+			pingCancel()
+			if pingErr == nil {
+				return sidecar, nil
+			}
+			lastErr = pingErr
 		} else {
-			lastErr = err
+			lastErr = statErr
 		}
 
 		select {
+		case exitErr := <-doneCh:
+			_ = os.Remove(socketPath)
+			return nil, fmt.Errorf("ipc: compiler sidecar exited early (%v): %s",
+				exitErr, strings.TrimSpace(stderrBuf.String()))
 		case <-waitCtx.Done():
 			_ = sidecar.Stop()
-			return nil, fmt.Errorf("ipc: compiler sidecar did not become ready on %q: %v", socketPath, lastErr)
+			return nil, fmt.Errorf("ipc: compiler sidecar did not become ready on %q: %v (stderr: %s)",
+				socketPath, lastErr, strings.TrimSpace(stderrBuf.String()))
 		case <-ticker.C:
 		}
 	}
@@ -301,12 +361,19 @@ func (s *Sidecar) Client() *Client { return s.client }
 
 // Stop terminates the background sidecar process and removes its socket file.
 func (s *Sidecar) Stop() error {
-	if s == nil || s.cmd == nil || s.cmd.Process == nil {
+	if s == nil {
 		return nil
 	}
-	_ = s.cmd.Process.Kill()
-	_, _ = s.cmd.Process.Wait()
-	_ = os.Remove(s.socketPath)
+	s.stopOnce.Do(func() {
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill()
+			select {
+			case <-s.doneCh:
+			case <-time.After(2 * time.Second):
+			}
+		}
+		_ = os.Remove(s.socketPath)
+	})
 	return nil
 }
 
@@ -316,4 +383,20 @@ func newRequestID() string {
 		return fmt.Sprintf("req_%d", time.Now().UTC().UnixNano())
 	}
 	return "req_" + hex.EncodeToString(b[:])
+}
+
+func dialEndpoint(ctx context.Context, dialer *net.Dialer, socketPath string) (net.Conn, error) {
+	// On Windows, CPython lacks AF_UNIX and publishes a loopback tcp://127.0.0.1:<port>
+	// descriptor file at socketPath. Native AF_UNIX sockets are used everywhere else.
+	if runtime.GOOS == "windows" {
+		if info, err := os.Lstat(socketPath); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() < 128 {
+			if raw, readErr := os.ReadFile(socketPath); readErr == nil {
+				endpoint := strings.TrimSpace(string(raw))
+				if addr, ok := strings.CutPrefix(endpoint, "tcp://"); ok && addr != "" {
+					return dialer.DialContext(ctx, "tcp", addr)
+				}
+			}
+		}
+	}
+	return dialer.DialContext(ctx, "unix", socketPath)
 }

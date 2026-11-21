@@ -135,9 +135,19 @@ def _seed_sqlite_session(repo_dir: Path, session_id: str, base_sha: str, port: i
 
 
 def _send_uds_rpc(sock_path: Path, payload: dict) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    if hasattr(socket, "AF_UNIX"):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        target: str | tuple[str, int] = str(sock_path)
+    else:
+        endpoint = sock_path.read_text(encoding="utf-8").strip()
+        addr = endpoint.removeprefix("tcp://")
+        host, port_str = addr.rsplit(":", 1)
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target = (host, int(port_str))
+
+    with client:
         client.settimeout(30.0)
-        client.connect(str(sock_path))
+        client.connect(target)
         client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         buf = b""
         while not buf.endswith(b"\n"):
