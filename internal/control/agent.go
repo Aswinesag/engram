@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"engram/internal/ipc"
 	"engram/internal/mcp"
 	"engram/internal/proxy"
 	"engram/internal/sandbox"
@@ -26,33 +28,41 @@ var (
 	ErrMaxStepsExceeded = errors.New("control: agent session exceeded maximum step limit")
 )
 
-// AgentLoopConfig wires all deterministic runtime, sandbox, and proxy subsystems together.
+// EvolutionClient abstracts the Unix Domain Socket IPC client for the Python
+// Evolution Compiler (implemented by *ipc.Client).
+type EvolutionClient interface {
+	Synthesize(ctx context.Context, params ipc.SynthesizeParams) (ipc.SynthesizeResult, error)
+}
+
+// AgentLoopConfig wires all deterministic runtime, sandbox, proxy, and evolution subsystems.
 type AgentLoopConfig struct {
-	Workspace     Workspace
-	Config        Config
-	Manifest      Manifest
-	Store         *store.Store
-	Router        *ModelRouter
-	WorktreeMgr   *worktree.Manager
-	SandboxRunner sandbox.Runner     // Optional override; defaults to Config.Sandbox.Mode
-	EgressProxy   *proxy.EgressProxy // Optional override; defaults to per-session local proxy
-	Scrubber      *proxy.Scrubber    // Optional override; defaults to .env-aware Scrubber when RedactSecrets=true
-	PythonBin     string
-	MaxSteps      int
-	SystemPrompt  string
-	Out           io.Writer
-	ErrOut        io.Writer
+	Workspace       Workspace
+	Config          Config
+	Manifest        Manifest
+	Store           *store.Store
+	Router          *ModelRouter
+	WorktreeMgr     *worktree.Manager
+	SandboxRunner   sandbox.Runner     // Optional override; defaults to Config.Sandbox.Mode
+	EgressProxy     *proxy.EgressProxy // Optional override; defaults to per-session local proxy
+	Scrubber        *proxy.Scrubber    // Optional override; defaults to .env-aware Scrubber when RedactSecrets=true
+	EvolutionClient EvolutionClient    // Optional UDS JSON-RPC client to Python Evolution Compiler
+	PythonBin       string
+	MaxSteps        int
+	SystemPrompt    string
+	Out             io.Writer
+	ErrOut          io.Writer
 }
 
 // AgentRunResult summarizes a completed or terminated session.
 type AgentRunResult struct {
-	SessionID         string
-	WorktreePath      string
-	BaseCommitSHA     string
-	HeadCommitSHA     string
-	FinalResponse     string
-	StepsRecorded     int
-	ConsecutiveErrors int
+	SessionID          string
+	WorktreePath       string
+	BaseCommitSHA      string
+	HeadCommitSHA      string
+	FinalResponse      string
+	StepsRecorded      int
+	ConsecutiveErrors  int
+	SynthesizedEngrams []ipc.SynthesizeResult
 }
 
 // AgentLoop executes the zero-framework, step-committed streaming agent loop.
@@ -99,7 +109,8 @@ func NewAgentLoop(cfg AgentLoopConfig) (*AgentLoop, error) {
 
 // Run executes taskPrompt inside an isolated detached Git worktree with a
 // per-session domain-allowlisted egress proxy, dual-mode command sandboxing,
-// automatic secret scrubbing, deterministic Python hooks, and strict context hygiene.
+// automatic secret scrubbing, deterministic Python hooks, strict context hygiene,
+// and closed-loop friction compilation via the Python Evolution Compiler.
 func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRunResult, runErr error) {
 	taskPrompt = strings.TrimSpace(taskPrompt)
 	if taskPrompt == "" {
@@ -221,15 +232,7 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 		return result, err
 	}
 
-	hookSpecs, err := LoadActiveHookSpecs(ctx, a.cfg.Store, a.cfg.Manifest)
-	if err != nil {
-		return result, err
-	}
-	gate, err := NewHookGate(HookGateConfig{
-		Workspace: a.cfg.Workspace,
-		Store:     a.cfg.Store,
-		PythonBin: a.cfg.PythonBin,
-	}, hookSpecs)
+	gate, err := a.reloadHookGate(ctx)
 	if err != nil {
 		return result, err
 	}
@@ -239,7 +242,17 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 	}
 	tools := host.Tools()
 	stepIndex := 0
+	errorTrigger := a.cfg.Config.Evolution.ConsecutiveErrorTrigger
+	if errorTrigger <= 0 {
+		errorTrigger = DefaultConsecutiveErrorTrigger
+	}
+
 	consecutiveErrors := 0
+	errorStreakStart := 0
+	fileEditCounts := make(map[string]int)
+	fileEditFirstStep := make(map[string]int)
+	triggeredFriction := make(map[string]struct{})
+	var pendingSessionFriction []ipc.FrictionEvent
 
 	for stepIndex < a.cfg.MaxSteps {
 		if err := ctx.Err(); err != nil {
@@ -288,6 +301,13 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 
 			if a.cfg.Out != nil && resp.Content != "" && !strings.HasSuffix(resp.Content, "\n") {
 				_, _ = io.WriteString(a.cfg.Out, "\n")
+			}
+
+			// If uncompiled friction occurred during the session, invoke Evolution Compiler at session end.
+			if len(pendingSessionFriction) > 0 && a.cfg.EvolutionClient != nil {
+				if synthRes, ok := a.invokeEvolutionCompiler(ctx, sessionID, sessWT.BaseCommitSHA, pendingSessionFriction); ok {
+					result.SynthesizedEngrams = append(result.SynthesizedEngrams, synthRes)
+				}
 			}
 
 			result.FinalResponse = resp.Content
@@ -446,14 +466,75 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 				return result, err
 			}
 
+			// 6. Real-Time Friction Detection & Closed-Loop Evolution Compiler Trigger.
+			var immediateFriction []ipc.FrictionEvent
+
 			if exitCode != 0 {
+				if consecutiveErrors == 0 {
+					errorStreakStart = stepIndex
+				}
 				consecutiveErrors++
-				if a.cfg.ErrOut != nil && consecutiveErrors >= a.cfg.Config.Evolution.ConsecutiveErrorTrigger {
-					fmt.Fprintf(a.cfg.ErrOut, "[friction] %d consecutive tool errors detected (session=%s, step=%d)\n",
-						consecutiveErrors, sessionID, stepIndex)
+				if consecutiveErrors >= errorTrigger {
+					key := fmt.Sprintf("err:%s:%d", tc.Name, errorStreakStart)
+					if _, already := triggeredFriction[key]; !already {
+						triggeredFriction[key] = struct{}{}
+						cmdText := extractCommandSummary(tc.Name, tc.Input)
+						ev := ipc.FrictionEvent{
+							StepRange: [2]int{errorStreakStart, stepIndex},
+							Pattern:   ipc.PatternRepeatedToolError,
+							ToolName:  tc.Name,
+							Summary: fmt.Sprintf("Agent ran '%s' %d consecutive times failing with: %s",
+								cmdText, consecutiveErrors, firstErrorLine(rawOutput)),
+						}
+						immediateFriction = append(immediateFriction, ev)
+						if a.cfg.ErrOut != nil {
+							fmt.Fprintf(a.cfg.ErrOut, "[friction] %d consecutive tool errors detected (session=%s, step=%d)\n",
+								consecutiveErrors, sessionID, stepIndex)
+						}
+					}
 				}
 			} else {
 				consecutiveErrors = 0
+				errorStreakStart = 0
+			}
+
+			if tc.Name == "write_file" || tc.Name == "edit_file" || tc.Name == "apply_patch" {
+				if targetPath := extractPathFromInput(tc.Input); targetPath != "" {
+					if fileEditCounts[targetPath] == 0 {
+						fileEditFirstStep[targetPath] = stepIndex
+					}
+					fileEditCounts[targetPath]++
+					if fileEditCounts[targetPath] >= errorTrigger {
+						key := "circular:" + targetPath
+						if _, already := triggeredFriction[key]; !already {
+							triggeredFriction[key] = struct{}{}
+							ev := ipc.FrictionEvent{
+								StepRange: [2]int{fileEditFirstStep[targetPath], stepIndex},
+								Pattern:   ipc.PatternCircularFileEdit,
+								ToolName:  tc.Name,
+								Summary: fmt.Sprintf("Agent edited '%s' %d times in a circular file edit loop.",
+									targetPath, fileEditCounts[targetPath]),
+							}
+							immediateFriction = append(immediateFriction, ev)
+						}
+					}
+				}
+			}
+
+			if len(immediateFriction) > 0 {
+				if a.cfg.EvolutionClient != nil {
+					if synthRes, ok := a.invokeEvolutionCompiler(ctx, sessionID, sessWT.BaseCommitSHA, immediateFriction); ok {
+						result.SynthesizedEngrams = append(result.SynthesizedEngrams, synthRes)
+						// Hot-reload active HookGate immediately if a shadow-verified hook became active.
+						if synthRes.ShadowVerified && synthRes.Kind == string(store.EngramKindHook) && synthRes.Status == string(store.EngramStatusActive) {
+							if updatedGate, reloadErr := a.reloadHookGate(ctx); reloadErr == nil {
+								gate = updatedGate
+							}
+						}
+					}
+				} else {
+					pendingSessionFriction = append(pendingSessionFriction, immediateFriction...)
+				}
 			}
 
 			messages = append(messages, Message{
@@ -469,6 +550,55 @@ func (a *AgentLoop) Run(ctx context.Context, taskPrompt string) (result AgentRun
 	result.StepsRecorded = stepIndex
 	result.ConsecutiveErrors = consecutiveErrors
 	return result, ErrMaxStepsExceeded
+}
+
+func (a *AgentLoop) invokeEvolutionCompiler(
+	ctx context.Context,
+	sessionID, baseCommitSHA string,
+	events []ipc.FrictionEvent,
+) (ipc.SynthesizeResult, bool) {
+	if a.cfg.EvolutionClient == nil || len(events) == 0 {
+		return ipc.SynthesizeResult{}, false
+	}
+
+	synthRes, err := a.cfg.EvolutionClient.Synthesize(ctx, ipc.SynthesizeParams{
+		SessionID:      sessionID,
+		RepoRoot:       a.cfg.Workspace.RepoRoot,
+		BaseCommitSHA:  baseCommitSHA,
+		FrictionEvents: events,
+	})
+	if err != nil {
+		if a.cfg.ErrOut != nil {
+			fmt.Fprintf(a.cfg.ErrOut, "[evolution] compiler.synthesize failed: %v\n", err)
+		}
+		return ipc.SynthesizeResult{}, false
+	}
+
+	if a.cfg.ErrOut != nil {
+		fmt.Fprintf(a.cfg.ErrOut, "[evolution] synthesized %s %s (%s, shadow_verified=%t, status=%s)\n",
+			synthRes.Kind, synthRes.EngramID, synthRes.FilePath, synthRes.ShadowVerified, synthRes.Status)
+	}
+	return synthRes, true
+}
+
+func (a *AgentLoop) reloadHookGate(ctx context.Context) (*HookGate, error) {
+	manifest := a.cfg.Manifest
+	if data, err := os.ReadFile(a.cfg.Workspace.ManifestPath()); err == nil {
+		var diskManifest Manifest
+		if jsonErr := json.Unmarshal(data, &diskManifest); jsonErr == nil {
+			manifest = diskManifest
+		}
+	}
+
+	hookSpecs, err := LoadActiveHookSpecs(ctx, a.cfg.Store, manifest)
+	if err != nil {
+		return nil, err
+	}
+	return NewHookGate(HookGateConfig{
+		Workspace: a.cfg.Workspace,
+		Store:     a.cfg.Store,
+		PythonBin: a.cfg.PythonBin,
+	}, hookSpecs)
 }
 
 func (a *AgentLoop) buildScrubber() (*proxy.Scrubber, error) {
@@ -519,6 +649,43 @@ func (a *AgentLoop) mountActiveTools(ctx context.Context, host *mcp.Host) error 
 		}
 	}
 	return nil
+}
+
+func extractCommandSummary(toolName string, input json.RawMessage) string {
+	var fields map[string]any
+	if err := json.Unmarshal(input, &fields); err == nil {
+		for _, k := range []string{"command", "cmd"} {
+			if v, ok := fields[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return toolName
+}
+
+func extractPathFromInput(input json.RawMessage) string {
+	var fields map[string]any
+	if err := json.Unmarshal(input, &fields); err == nil {
+		for _, k := range []string{"path", "file_path"} {
+			if v, ok := fields[k].(string); ok && strings.TrimSpace(v) != "" {
+				return filepath.ToSlash(strings.TrimSpace(v))
+			}
+		}
+	}
+	return ""
+}
+
+func firstErrorLine(output string) string {
+	for _, ln := range strings.Split(output, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln != "" && !strings.HasPrefix(ln, "exit_code=") {
+			if len(ln) > 180 {
+				return ln[:180]
+			}
+			return ln
+		}
+	}
+	return "non-zero exit code"
 }
 
 func defaultAgentSystemPrompt() string {

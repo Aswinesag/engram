@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"engram/internal/ipc"
+	"engram/internal/sandbox"
 	"engram/internal/store"
 )
 
@@ -508,5 +511,240 @@ func TestPhase2SecurityIntegrationScrubsLLMPayloadAndInjectsEgressProxy(t *testi
 	}
 	if !strings.Contains(payload, "[REDACTED:known_env_value]") || !strings.Contains(payload, "[REDACTED:ssh_private_key]") {
 		t.Fatalf("expected redaction markers in outbound LLM payload:\n%s", payload)
+	}
+}
+
+type simulatedServiceSandbox struct {
+	port           int
+	serviceStarted atomic.Bool
+	pytestCalls    atomic.Int32
+	listener       net.Listener
+}
+
+func (s *simulatedServiceSandbox) Backend() string { return "sim-phase3" }
+
+func (s *simulatedServiceSandbox) Run(_ context.Context, req sandbox.ExecRequest) (sandbox.ExecResult, error) {
+	if strings.Contains(req.Command, "docker compose") {
+		if !s.serviceStarted.Swap(true) {
+			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.port))
+			if err != nil {
+				return sandbox.ExecResult{Output: err.Error(), ExitCode: 1, Backend: s.Backend()}, nil
+			}
+			s.listener = ln
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					_ = c.Close()
+				}
+			}()
+		}
+		return sandbox.ExecResult{Output: "db container started\n", ExitCode: 0, Backend: s.Backend()}, nil
+	}
+
+	if strings.HasPrefix(strings.TrimSpace(req.Command), "pytest") {
+		s.pytestCalls.Add(1)
+		if !s.serviceStarted.Load() {
+			return sandbox.ExecResult{
+				Output:   fmt.Sprintf("psycopg.OperationalError: ConnectionRefusedError on port %d\n", s.port),
+				ExitCode: 1,
+				Backend:  s.Backend(),
+			}, nil
+		}
+		return sandbox.ExecResult{Output: "12 passed in 0.4s\n", ExitCode: 0, Backend: s.Backend()}, nil
+	}
+
+	return sandbox.ExecResult{Output: "ok\n", ExitCode: 0, Backend: s.Backend()}, nil
+}
+
+func (s *simulatedServiceSandbox) Close() {
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+}
+
+func TestPhase3ClosedLoopRun1SynthesizesHookAndRun2PassesCleanly(t *testing.T) {
+	pyBin, err := ResolvePythonBinary()
+	if err != nil {
+		t.Skipf("python not found: %v", err)
+	}
+	compilerDir, err := filepath.Abs(filepath.Join("..", "..", "compiler"))
+	if err != nil {
+		t.Fatalf("resolve compiler dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(compilerDir, "engram_compiler", "server.py")); err != nil {
+		t.Skipf("python compiler not found at %q", compilerDir)
+	}
+
+	ctx := context.Background()
+	ws := initTestGitRepoForAgent(t)
+	if err := os.WriteFile(filepath.Join(ws.RepoRoot, "docker-compose.test.yml"),
+		[]byte("services:\n  db: {}\n"), 0o644); err != nil {
+		t.Fatalf("write docker-compose.test.yml: %v", err)
+	}
+
+	// Reserve an unused local TCP port for the simulated test DB.
+	portProbe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	testPort := portProbe.Addr().(*net.TCPAddr).Port
+	_ = portProbe.Close()
+
+	// Start the real Python Evolution Compiler UDS sidecar.
+	sockPath, err := ipc.SocketPathForRepo(ws.RepoRoot)
+	if err != nil {
+		t.Fatalf("SocketPathForRepo: %v", err)
+	}
+	sidecar, err := ipc.StartSidecar(ctx, pyBin, compilerDir, sockPath)
+	if err != nil {
+		t.Fatalf("StartSidecar: %v", err)
+	}
+	t.Cleanup(func() { _ = sidecar.Stop() })
+
+	st, err := store.Open(ctx, ws.StateDBPath())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// --- RUN 1 (Cold Harness): 3 consecutive pytest ConnectionRefusedError failures ---
+	var run1Turns atomic.Int32
+	mockLLMRun1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch run1Turns.Add(1) {
+		case 1, 2, 3:
+			writeAnthropicToolTurn(w, "Running pytest suite.", fmt.Sprintf("r1_%d", run1Turns.Load()), "bash", map[string]any{
+				"command": "pytest tests/api",
+			})
+		case 4:
+			writeAnthropicTextTurn(w, "Tests failed due to refused database connection.")
+		default:
+			t.Fatalf("unexpected Run 1 turn")
+		}
+	}))
+	t.Cleanup(mockLLMRun1.Close)
+
+	simRun1 := &simulatedServiceSandbox{port: testPort}
+	t.Cleanup(simRun1.Close)
+
+	cfg1 := DefaultConfig()
+	cfg1.Model.Endpoint = mockLLMRun1.URL
+	router1, err := NewModelRouter(cfg1.Model, "test-key", mockLLMRun1.Client())
+	if err != nil {
+		t.Fatalf("NewModelRouter(run1): %v", err)
+	}
+
+	loop1, err := NewAgentLoop(AgentLoopConfig{
+		Workspace:       ws,
+		Config:          cfg1,
+		Manifest:        DefaultManifest(),
+		Store:           st,
+		Router:          router1,
+		SandboxRunner:   simRun1,
+		EvolutionClient: sidecar.Client(),
+		PythonBin:       pyBin,
+	})
+	if err != nil {
+		t.Fatalf("NewAgentLoop(run1): %v", err)
+	}
+
+	res1, err := loop1.Run(ctx, "Run API test suite")
+	if err != nil {
+		t.Fatalf("Run 1 error = %v", err)
+	}
+	if len(res1.SynthesizedEngrams) != 1 {
+		t.Fatalf("Run 1 synthesized %d engrams, want 1", len(res1.SynthesizedEngrams))
+	}
+	compiled := res1.SynthesizedEngrams[0]
+	if !compiled.ShadowVerified || compiled.Status != "active" || compiled.Kind != "hook" {
+		t.Fatalf("Run 1 compiled engram = %+v, want active shadow-verified hook", compiled)
+	}
+
+	// --- RUN 2 (Self-Evolved Harness): identical task inherits compiled hook automatically ---
+	_, cfg2, manifest2, err := LoadWorkspace(ctx, ws.RepoRoot)
+	if err != nil {
+		t.Fatalf("LoadWorkspace(run2): %v", err)
+	}
+
+	var run2Turns atomic.Int32
+	var run2SawHookGuidance atomic.Bool
+	mockLLMRun2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch run2Turns.Add(1) {
+		case 1:
+			// Agent tries the exact same pytest command first -> intercepted by synthesized hook (exit 2)!
+			writeAnthropicToolTurn(w, "Running pytest suite.", "r2_1", "bash", map[string]any{
+				"command": "pytest tests/api",
+			})
+		case 2:
+			if strings.Contains(string(body), "docker-compose.test.yml") {
+				run2SawHookGuidance.Store(true)
+			}
+			// Agent follows deterministic hook guidance and starts DB container first.
+			writeAnthropicToolTurn(w, "Starting test DB container.", "r2_2", "bash", map[string]any{
+				"command": "docker compose -f docker-compose.test.yml up -d",
+			})
+		case 3:
+			// Agent retries pytest -> port is now open -> hook exits 0 -> pytest passes!
+			writeAnthropicToolTurn(w, "Retrying pytest now that DB is up.", "r2_3", "bash", map[string]any{
+				"command": "pytest tests/api",
+			})
+		case 4:
+			writeAnthropicTextTurn(w, "All 12 API tests passed.")
+		default:
+			t.Fatalf("unexpected Run 2 turn")
+		}
+	}))
+	t.Cleanup(mockLLMRun2.Close)
+
+	simRun2 := &simulatedServiceSandbox{port: testPort}
+	t.Cleanup(simRun2.Close)
+
+	cfg2.Model.Endpoint = mockLLMRun2.URL
+	router2, err := NewModelRouter(cfg2.Model, "test-key", mockLLMRun2.Client())
+	if err != nil {
+		t.Fatalf("NewModelRouter(run2): %v", err)
+	}
+
+	loop2, err := NewAgentLoop(AgentLoopConfig{
+		Workspace:     ws,
+		Config:        cfg2,
+		Manifest:      manifest2,
+		Store:         st,
+		Router:        router2,
+		SandboxRunner: simRun2,
+		PythonBin:     pyBin,
+	})
+	if err != nil {
+		t.Fatalf("NewAgentLoop(run2): %v", err)
+	}
+
+	res2, err := loop2.Run(ctx, "Run API test suite")
+	if err != nil {
+		t.Fatalf("Run 2 error = %v", err)
+	}
+	if !run2SawHookGuidance.Load() {
+		t.Fatalf("Run 2 LLM did not receive synthesized hook guidance")
+	}
+	// On Run 2, pytest should have only executed ONCE (after the DB started; the failing attempt was prevented!).
+	if simRun2.pytestCalls.Load() != 1 {
+		t.Fatalf("Run 2 pytest executed %d times, want 1 (initial failing attempt blocked by hook)", simRun2.pytestCalls.Load())
+	}
+	if !strings.Contains(res2.FinalResponse, "12 API tests passed") {
+		t.Fatalf("unexpected Run 2 response: %q", res2.FinalResponse)
+	}
+
+	// Verify SQLite engram metrics recorded the prevented error on Run 2.
+	eng, err := st.GetEngram(ctx, compiled.EngramID)
+	if err != nil {
+		t.Fatalf("GetEngram(%q): %v", compiled.EngramID, err)
+	}
+	if eng.TimesPreventedError < 1 || eng.TimesTriggered < 2 {
+		t.Fatalf("engram telemetry = triggered:%d prevented:%d, want >=2 triggered and >=1 prevented",
+			eng.TimesTriggered, eng.TimesPreventedError)
 	}
 }
