@@ -5,17 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"engram/internal/control"
 	"engram/internal/store"
 	"engram/internal/worktree"
+	"engram/ui"
 )
 
 // RunRequest captures the validated inputs for `engram run`.
@@ -140,6 +144,8 @@ func NewRootCmd(deps Dependencies) *cobra.Command {
 		newStatusCmd(&repoDir),
 		newRewindCmd(&repoDir, deps.Rewinder),
 		newRunCmd(&repoDir, deps.Runner),
+		newUICmd(&repoDir),
+		newRulesCmd(&repoDir),
 	)
 
 	return root
@@ -330,6 +336,222 @@ func newRunCmd(repoDir *string, runner AgentRunner) *cobra.Command {
 	}
 
 	return cmd
+}
+
+func newUICmd(repoDir *string) *cobra.Command {
+	var addr string
+
+	cmd := &cobra.Command{
+		Use:   "ui",
+		Short: "Launch the embedded Observability & Time-Travel Web UI",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			ws, cfg, _, err := control.LoadWorkspace(ctx, *repoDir)
+			if err != nil {
+				return err
+			}
+
+			st, err := store.Open(ctx, ws.StateDBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			wtMgr, err := worktree.NewManager(ws.RepoRoot, ws.WorktreesDir())
+			if err != nil {
+				return err
+			}
+
+			distFS, err := ui.DistFS()
+			if err != nil {
+				return fmt.Errorf("load embedded UI assets: %w", err)
+			}
+
+			uiSrv, err := control.NewUIServer(control.UIServerConfig{
+				Workspace:   ws,
+				Config:      cfg,
+				Store:       st,
+				WorktreeMgr: wtMgr,
+				StaticFS:    distFS,
+			})
+			if err != nil {
+				return err
+			}
+
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return fmt.Errorf("listen on %s: %w", addr, err)
+			}
+
+			srv := &http.Server{
+				Handler:           uiSrv.Handler(),
+				ReadHeaderTimeout: 15 * time.Second,
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "Engram UI listening at http://%s (WebSocket: ws://%s/ws)\n",
+				ln.Addr().String(), ln.Addr().String())
+
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- srv.Serve(ln)
+			}()
+
+			select {
+			case <-ctx.Done():
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = srv.Shutdown(shutdownCtx)
+				return nil
+			case err := <-errCh:
+				if errors.Is(err, http.ErrServerClosed) {
+					return nil
+				}
+				return err
+			}
+		},
+	}
+
+	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:7420", "local listen address for the Observability UI")
+	return cmd
+}
+
+func newRulesCmd(repoDir *string) *cobra.Command {
+	rulesCmd := &cobra.Command{
+		Use:   "rules",
+		Short: "Inspect, approve, or reject compiled engrams (hooks, tools, and scoped rules)",
+	}
+
+	var statusFilter, kindFilter string
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List compiled engrams in SQLite",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			ws, _, _, err := control.LoadWorkspace(ctx, *repoDir)
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(ctx, ws.StateDBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			engrams, err := st.ListEngrams(ctx, store.EngramFilter{
+				Status: store.EngramStatus(strings.TrimSpace(statusFilter)),
+				Kind:   store.EngramKind(strings.TrimSpace(kindFilter)),
+			})
+			if err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			if len(engrams) == 0 {
+				fmt.Fprintln(out, "No engrams found.")
+				return nil
+			}
+
+			tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(tw, "ID\tKIND\tSTATUS\tSHADOW\tPREVENTED\tTRIGGER\tPATH")
+			for _, e := range engrams {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%.0f%%\t%d/%d\t%s\t%s\n",
+					e.ID, e.Kind, e.Status, e.ShadowPassRate*100,
+					e.TimesPreventedError, e.TimesTriggered,
+					truncate(e.TriggerPattern, 24), e.FilePath)
+			}
+			return tw.Flush()
+		},
+	}
+	listCmd.Flags().StringVar(&statusFilter, "status", "", "filter by status (shadow_testing, pending_approval, active, rejected)")
+	listCmd.Flags().StringVar(&kindFilter, "kind", "", "filter by kind (hook, tool, rule)")
+
+	showCmd := &cobra.Command{
+		Use:   "show <engram-id>",
+		Short: "Display human-auditable metadata and source code for an engram",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			ws, _, _, err := control.LoadWorkspace(ctx, *repoDir)
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(ctx, ws.StateDBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			eng, err := st.GetEngram(ctx, args[0])
+			if err != nil {
+				return err
+			}
+			src, err := control.ReadEngramSource(ws, eng.FilePath)
+			if err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "ID:        %s\nKind:      %s\nStatus:    %s\nTrigger:   %s\nShadow:    %.0f%%\nFile:      %s\n\n%s",
+				eng.ID, eng.Kind, eng.Status, eng.TriggerPattern, eng.ShadowPassRate*100, eng.FilePath, src)
+			if !strings.HasSuffix(src, "\n") {
+				fmt.Fprintln(out)
+			}
+			return nil
+		},
+	}
+
+	approveCmd := &cobra.Command{
+		Use:   "approve <engram-id>",
+		Short: "Approve and activate a shadow-verified engram",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			ws, _, _, err := control.LoadWorkspace(ctx, *repoDir)
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(ctx, ws.StateDBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			eng, err := control.ApproveEngram(ctx, ws, st, args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Approved engram %s (status=%s)\n", eng.ID, eng.Status)
+			return nil
+		},
+	}
+
+	rejectCmd := &cobra.Command{
+		Use:   "reject <engram-id>",
+		Short: "Reject an engram so it is excluded from runtime activation",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			ws, _, _, err := control.LoadWorkspace(ctx, *repoDir)
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(ctx, ws.StateDBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			eng, err := control.RejectEngram(ctx, ws, st, args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Rejected engram %s (status=%s)\n", eng.ID, eng.Status)
+			return nil
+		},
+	}
+
+	rulesCmd.AddCommand(listCmd, showCmd, approveCmd, rejectCmd)
+	return rulesCmd
 }
 
 func shortSHA(sha string) string {

@@ -471,3 +471,53 @@ func mustQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+func TestCLIRulesListShowApproveAndReject(t *testing.T) {
+	repo := initTempGitRepo(t)
+	if _, err := executeCLI(defaultDependencies(), "init", "--repo", repo); err != nil {
+		t.Fatalf("engram init error = %v", err)
+	}
+
+	ws := control.Workspace{RepoRoot: repo}
+	hookSrc := "import sys\nprint('ok')\nsys.exit(0)\n"
+	if err := os.WriteFile(filepath.Join(ws.HooksDir(), "eng_cli_1.py"), []byte(hookSrc), 0o644); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, ws.StateDBPath())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := st.CreateEngram(ctx, store.Engram{
+		ID:               "eng_cli_1",
+		Kind:             store.EngramKindHook,
+		TriggerPattern:   `^pytest\b`,
+		FilePath:         "hooks/eng_cli_1.py",
+		FailureSignature: "sig_cli_1",
+		Status:           store.EngramStatusPendingApproval,
+		ShadowPassRate:   1.0,
+	}); err != nil {
+		t.Fatalf("CreateEngram: %v", err)
+	}
+	_ = st.Close()
+
+	listOut, err := executeCLI(defaultDependencies(), "rules", "list", "--status", "pending_approval", "--repo", repo)
+	if err != nil || !strings.Contains(listOut, "eng_cli_1") {
+		t.Fatalf("rules list = %q, err = %v", listOut, err)
+	}
+
+	showOut, err := executeCLI(defaultDependencies(), "rules", "show", "eng_cli_1", "--repo", repo)
+	if err != nil || !strings.Contains(showOut, "sys.exit(0)") {
+		t.Fatalf("rules show = %q, err = %v", showOut, err)
+	}
+
+	approveOut, err := executeCLI(defaultDependencies(), "rules", "approve", "eng_cli_1", "--repo", repo)
+	if err != nil || !strings.Contains(approveOut, "status=active") {
+		t.Fatalf("rules approve = %q, err = %v", approveOut, err)
+	}
+
+	rejectOut, err := executeCLI(defaultDependencies(), "rules", "reject", "eng_cli_1", "--repo", repo)
+	if err != nil || !strings.Contains(rejectOut, "status=rejected") {
+		t.Fatalf("rules reject = %q, err = %v", rejectOut, err)
+	}
+}
