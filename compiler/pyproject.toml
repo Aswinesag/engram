@@ -1,0 +1,17 @@
+[project]
+name = "engram-compiler"
+version = "0.1.0"
+description = "Zero-framework Python 3.12+ Evolution Compiler & Shadow Evaluator for Engram"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+engram-compiler = "engram_compiler.server:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["engram_compiler*"]
