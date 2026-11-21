@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -37,10 +39,53 @@ type WorktreeRewinder interface {
 	Rewind(ctx context.Context, ws control.Workspace, sess store.Session, target store.Step) error
 }
 
-// Dependencies decouples CLI wiring from runtime subsystems during incremental phase rollout.
+// Dependencies decouples CLI wiring from runtime subsystems during testing and rollout.
 type Dependencies struct {
 	Runner   AgentRunner
 	Rewinder WorktreeRewinder
+}
+
+type defaultAgentRunner struct{}
+
+func (defaultAgentRunner) Run(ctx context.Context, req RunRequest) error {
+	router, err := control.NewModelRouter(req.Config.Model, "", nil)
+	if err != nil {
+		return err
+	}
+
+	wtMgr, err := worktree.NewManager(req.Workspace.RepoRoot, req.Workspace.WorktreesDir())
+	if err != nil {
+		return err
+	}
+
+	loop, err := control.NewAgentLoop(control.AgentLoopConfig{
+		Workspace:   req.Workspace,
+		Config:      req.Config,
+		Manifest:    req.Manifest,
+		Store:       req.Store,
+		Router:      router,
+		WorktreeMgr: wtMgr,
+		Out:         req.Out,
+		ErrOut:      req.ErrOut,
+	})
+	if err != nil {
+		return err
+	}
+
+	res, err := loop.Run(ctx, req.TaskPrompt)
+	if err != nil {
+		if res.SessionID != "" && req.ErrOut != nil {
+			fmt.Fprintf(req.ErrOut, "\nSession %s terminated (head: %s, worktree: %s)\n",
+				res.SessionID, shortSHA(res.HeadCommitSHA), res.WorktreePath)
+		}
+		return err
+	}
+
+	if req.Out != nil {
+		fmt.Fprintf(req.Out, "\nSession: %s (steps: %d, head: %s, worktree: %s)\n",
+			res.SessionID, res.StepsRecorded, shortSHA(res.HeadCommitSHA), res.WorktreePath)
+	}
+	return nil
 }
 
 type defaultWorktreeRewinder struct{}
@@ -55,13 +100,17 @@ func (defaultWorktreeRewinder) Rewind(ctx context.Context, ws control.Workspace,
 
 func defaultDependencies() Dependencies {
 	return Dependencies{
+		Runner:   defaultAgentRunner{},
 		Rewinder: defaultWorktreeRewinder{},
 	}
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cmd := NewRootCmd(defaultDependencies())
-	if err := cmd.Execute(); err != nil {
+	if err := cmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -69,6 +118,9 @@ func main() {
 
 // NewRootCmd constructs the Engram Cobra command tree.
 func NewRootCmd(deps Dependencies) *cobra.Command {
+	if deps.Runner == nil {
+		deps.Runner = defaultAgentRunner{}
+	}
 	if deps.Rewinder == nil {
 		deps.Rewinder = defaultWorktreeRewinder{}
 	}
@@ -264,10 +316,6 @@ func newRunCmd(repoDir *string, runner AgentRunner) *cobra.Command {
 				return err
 			}
 			defer st.Close()
-
-			if runner == nil {
-				return errors.New("agent runtime is not configured")
-			}
 
 			return runner.Run(ctx, RunRequest{
 				Workspace:  ws,
