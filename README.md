@@ -194,6 +194,16 @@ The multi-pass evaluation harness (`benchmarks/run_benchmark.py`) measures **Run
 | `swe_circular_async_edit` | 2 | PASS | 1 | 0 | 1 | 1,805 | 1.0 | — |
 | `swe_circular_async_edit` | 3 | PASS | 1 | 0 | 1 | 1,805 | 0.1 | — |
 
+## Real-World Stress Test (`pallets/click`)
+
+To validate Engram outside synthetic benchmarks, we ran an unconfigured cold-start test against [`pallets/click`](https://github.com) with `pypi.org` omitted from `.engram/config.toml` (`sandbox.allowed_domains`):
+
+* **Zero Host Mutation:** Isolated every agent session inside a detached Git worktree (`.engram/.runtime/worktrees/`), leaving the primary `click` repository completely clean (`git status` untouched).
+* **Egress Proxy Enforcement:** Intercepted and blocked unauthorized outbound `pip install` attempts (`[egress-proxy] blocked connect -> pypi.org`).
+* **Autonomous Hook Synthesis & Shadow Verification:** Upon detecting consecutive `pip` tunnel failures, the Python Evolution Compiler synthesized `.engram/hooks/eng_1A202FA5072521870_guard_python.py`, validated it via AST, and achieved a **100% shadow replay pass rate** before queuing it for human approval.
+* **Deterministic Continual Learning (Run 2):** Once approved (`engram rules approve`), the active hook intercepted **9/9 (`100%`)** subsequent failing invocations in a fresh session via deterministic exit code `2` before they could hit the sandbox or network.
+
+
 #### Reproduce Benchmarks
 
 ```bash
