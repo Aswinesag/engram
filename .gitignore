@@ -1,0 +1,46 @@
+# Compiled Go binaries & test artifacts
+bin/
+dist/
+engram
+engram.exe
+*.exe
+*.test
+*.out
+coverage.txt
+
+# UI dependencies & Vite build assets
+# Keep ui/dist/index.html tracked so `//go:embed all:dist` compiles on a fresh clone
+ui/node_modules/
+ui/.vite/
+ui/dist/*
+!ui/dist/index.html
+
+# Python Evolution Compiler artifacts & virtualenvs
+compiler/dist/
+compiler/.venv/
+compiler/*.egg-info/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local Engram runtime state (SQLite WAL, spilled artifacts, detached worktrees)
+.engram/.runtime/
+*.db-wal
+*.db-shm
+
+# Benchmark run outputs
+benchmarks/results/
+
+# Local secrets & environment files
+.env
+.env.*
+!.env.example
+
+# OS & editor clutter
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
