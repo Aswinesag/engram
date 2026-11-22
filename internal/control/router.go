@@ -837,7 +837,172 @@ func (r *ModelRouter) streamOllama(ctx context.Context, req ChatRequest, onDelta
 		return ChatResponse{}, fmt.Errorf("control: ollama HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 
-	return parseOllamaNDJSON(resp.Body, onDelta)
+	res, err := parseOllamaNDJSON(resp.Body, onDelta)
+	if err != nil {
+		return ChatResponse{}, err
+	}
+
+	if len(res.ToolCalls) == 0 && len(req.Tools) > 0 && strings.TrimSpace(res.Content) != "" {
+		allowedTools := make(map[string]struct{}, len(req.Tools))
+		for _, t := range req.Tools {
+			allowedTools[t.Name] = struct{}{}
+		}
+		if calls, cleaned := extractInlineOllamaToolCalls(res.Content, allowedTools); len(calls) > 0 {
+			res.ToolCalls = calls
+			res.Content = cleaned
+		}
+	}
+
+	return res, nil
+}
+
+func extractInlineOllamaToolCalls(content string, allowedTools map[string]struct{}) ([]ToolCall, string) {
+	var (
+		calls       []ToolCall
+		cleanParts  strings.Builder
+		cursor      int
+		nextCallIdx int
+	)
+
+	for i := 0; i < len(content); {
+		if content[i] != '{' && content[i] != '[' {
+			i++
+			continue
+		}
+
+		dec := json.NewDecoder(strings.NewReader(content[i:]))
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			i++
+			continue
+		}
+		end := i + int(dec.InputOffset())
+
+		parsed := parseInlineToolCallJSON(raw, allowedTools, &nextCallIdx)
+		if len(parsed) == 0 {
+			i = end
+			continue
+		}
+
+		// Trim optional enclosing <tool_call>...</tool_call> or ```json ... ``` wrappers.
+		spanStart, spanEnd := expandToolCallWrapper(content, i, end)
+		if spanStart > cursor {
+			cleanParts.WriteString(content[cursor:spanStart])
+		}
+		calls = append(calls, parsed...)
+		cursor = spanEnd
+		i = spanEnd
+	}
+
+	if len(calls) == 0 {
+		return nil, content
+	}
+	if cursor < len(content) {
+		cleanParts.WriteString(content[cursor:])
+	}
+	return calls, strings.TrimSpace(cleanParts.String())
+}
+
+func parseInlineToolCallJSON(raw json.RawMessage, allowedTools map[string]struct{}, nextIdx *int) []ToolCall {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+
+	if trimmed[0] == '[' {
+		var items []json.RawMessage
+		if err := json.Unmarshal(trimmed, &items); err != nil || len(items) == 0 {
+			return nil
+		}
+		var out []ToolCall
+		for _, item := range items {
+			tc, ok := parseSingleInlineToolCall(item, allowedTools, nextIdx)
+			if !ok {
+				return nil
+			}
+			out = append(out, tc)
+		}
+		return out
+	}
+
+	if tc, ok := parseSingleInlineToolCall(trimmed, allowedTools, nextIdx); ok {
+		return []ToolCall{tc}
+	}
+	return nil
+}
+
+func parseSingleInlineToolCall(raw json.RawMessage, allowedTools map[string]struct{}, nextIdx *int) (ToolCall, bool) {
+	var obj struct {
+		ID         string          `json:"id"`
+		Name       string          `json:"name"`
+		Arguments  json.RawMessage `json:"arguments"`
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ToolCall{}, false
+	}
+
+	name := strings.TrimSpace(obj.Name)
+	if name == "" {
+		return ToolCall{}, false
+	}
+	if _, allowed := allowedTools[name]; !allowed {
+		return ToolCall{}, false
+	}
+
+	argsRaw := bytes.TrimSpace(obj.Arguments)
+	if len(argsRaw) == 0 {
+		argsRaw = bytes.TrimSpace(obj.Parameters)
+	}
+	if len(argsRaw) == 0 {
+		argsRaw = []byte("{}")
+	}
+
+	// Some local models encode arguments as a JSON-escaped string.
+	if argsRaw[0] == '"' {
+		var unquoted string
+		if err := json.Unmarshal(argsRaw, &unquoted); err != nil {
+			return ToolCall{}, false
+		}
+		argsRaw = bytes.TrimSpace([]byte(unquoted))
+	}
+	if len(argsRaw) == 0 || argsRaw[0] != '{' || !json.Valid(argsRaw) {
+		return ToolCall{}, false
+	}
+
+	id := strings.TrimSpace(obj.ID)
+	if id == "" {
+		id = fmt.Sprintf("ollama_inline_%d", *nextIdx)
+		*nextIdx++
+	}
+	return ToolCall{
+		ID:    id,
+		Name:  name,
+		Input: json.RawMessage(argsRaw),
+	}, true
+}
+
+func expandToolCallWrapper(content string, start, end int) (int, int) {
+	prefix := strings.TrimRight(content[:start], " \t\r\n")
+	suffix := strings.TrimLeft(content[end:], " \t\r\n")
+
+	if strings.HasSuffix(prefix, "<tool_call>") && strings.HasPrefix(suffix, "</tool_call>") {
+		newStart := len(prefix) - len("<tool_call>")
+		wsAfter := len(content[end:]) - len(suffix)
+		newEnd := end + wsAfter + len("</tool_call>")
+		return newStart, newEnd
+	}
+
+	for _, fence := range []string{"```json", "```JSON", "```"} {
+		if strings.HasSuffix(prefix, fence) && strings.HasPrefix(suffix, "```") {
+			newStart := len(prefix) - len(fence)
+			wsAfter := len(content[end:]) - len(suffix)
+			newEnd := end + wsAfter + len("```")
+			return newStart, newEnd
+		}
+	}
+
+	return start, end
 }
 
 func encodeOllamaMessages(systemPrompt string, msgs []Message) []ollamaMessage {

@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"engram/internal/ipc"
+	"engram/internal/mcp"
 	"engram/internal/sandbox"
 	"engram/internal/store"
 )
@@ -746,5 +747,91 @@ func TestPhase3ClosedLoopRun1SynthesizesHookAndRun2PassesCleanly(t *testing.T) {
 	if eng.TimesPreventedError < 1 || eng.TimesTriggered < 2 {
 		t.Fatalf("engram telemetry = triggered:%d prevented:%d, want >=2 triggered and >=1 prevented",
 			eng.TimesTriggered, eng.TimesPreventedError)
+	}
+}
+
+func TestOllamaInlineTextToolCallFallback(t *testing.T) {
+	ctx := context.Background()
+	tools := []mcp.ToolDefinition{
+		{Name: "write_file"},
+		{Name: "bash"},
+	}
+
+	tests := []struct {
+		name         string
+		streamedText string
+		wantCalls    int
+		wantTool     string
+		wantClean    string
+	}{
+		{
+			name:         "bare json from qwen2.5-coder",
+			streamedText: `{"name": "write_file", "arguments": {"path": "hello.py", "content": "print(\"Hello Engram\")"}}`,
+			wantCalls:    1,
+			wantTool:     "write_file",
+			wantClean:    "",
+		},
+		{
+			name:         "xml tool_call wrapper with prose",
+			streamedText: "Creating script.\n<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"python hello.py\"}}\n</tool_call>",
+			wantCalls:    1,
+			wantTool:     "bash",
+			wantClean:    "Creating script.",
+		},
+		{
+			name:         "markdown json code fence",
+			streamedText: "```json\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.txt\",\"content\":\"ok\"}}\n```",
+			wantCalls:    1,
+			wantTool:     "write_file",
+			wantClean:    "",
+		},
+		{
+			name:         "non-tool json is ignored",
+			streamedText: `Finished! Result: {"name": "Alice", "arguments": {"role": "user"}}`,
+			wantCalls:    0,
+			wantClean:    `Finished! Result: {"name": "Alice", "arguments": {"role": "user"}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				chunk, _ := json.Marshal(map[string]any{
+					"message":           map[string]any{"role": "assistant", "content": tc.streamedText},
+					"done":              true,
+					"prompt_eval_count": 50,
+					"eval_count":        20,
+				})
+				fmt.Fprintln(w, string(chunk))
+			}))
+			t.Cleanup(srv.Close)
+
+			router, err := NewModelRouter(ModelConfig{
+				Provider: "ollama",
+				Model:    "qwen2.5-coder:7b",
+				Endpoint: srv.URL,
+			}, "", srv.Client())
+			if err != nil {
+				t.Fatalf("NewModelRouter: %v", err)
+			}
+
+			res, err := router.StreamChat(ctx, ChatRequest{
+				Messages: []Message{{Role: RoleUser, Content: "do task"}},
+				Tools:    tools,
+			}, nil)
+			if err != nil {
+				t.Fatalf("StreamChat: %v", err)
+			}
+			if len(res.ToolCalls) != tc.wantCalls {
+				t.Fatalf("ToolCalls len = %d, want %d (%+v)", len(res.ToolCalls), tc.wantCalls, res.ToolCalls)
+			}
+			if tc.wantCalls > 0 && res.ToolCalls[0].Name != tc.wantTool {
+				t.Fatalf("ToolCalls[0].Name = %q, want %q", res.ToolCalls[0].Name, tc.wantTool)
+			}
+			if res.Content != tc.wantClean {
+				t.Fatalf("Content = %q, want %q", res.Content, tc.wantClean)
+			}
+		})
 	}
 }
