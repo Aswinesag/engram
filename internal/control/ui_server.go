@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	wsMagicGUID        = "258EAFA5-E914-47DF-95CA-C5AB0DC85B11"
+	wsMagicGUID        = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	maxRPCMessageBytes = 4 << 20 // 4 MiB
 )
 

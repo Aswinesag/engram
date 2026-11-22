@@ -246,11 +246,19 @@ func callTestWebSocketRPC(t *testing.T, addr, payload string) string {
 	if err != nil || !strings.Contains(statusLine, "101") {
 		t.Fatalf("ws upgrade status = %q, err = %v", statusLine, err)
 	}
+
+	var acceptHeader string
 	for {
 		ln, err := br.ReadString('\n')
 		if err != nil || ln == "\r\n" {
 			break
 		}
+		if strings.HasPrefix(strings.ToLower(ln), "sec-websocket-accept:") {
+			acceptHeader = strings.TrimSpace(strings.SplitN(ln, ":", 2)[1])
+		}
+	}
+	if acceptHeader != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("Sec-WebSocket-Accept = %q, want RFC 6455 vector %q", acceptHeader, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
 	}
 
 	// Send masked RFC 6455 text frame.
