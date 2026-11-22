@@ -64,9 +64,10 @@ func (defaultAgentRunner) Run(ctx context.Context, req RunRequest) error {
 	}
 
 	var evoClient control.EvolutionClient
-	if sockPath, sockErr := ipc.SocketPathForRepo(req.Workspace.RepoRoot); sockErr == nil {
+	sockPath, sockErr := ipc.SocketPathForRepo(req.Workspace.RepoRoot)
+	if sockErr == nil {
 		candidate := ipc.NewClient(sockPath, 0)
-		pingCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		pingCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		_, pingErr := candidate.Ping(pingCtx)
 		cancel()
 
@@ -77,8 +78,12 @@ func (defaultAgentRunner) Run(ctx context.Context, req RunRequest) error {
 				if sidecar, scErr := ipc.StartSidecar(ctx, pyBin, compilerDir, sockPath); scErr == nil {
 					defer func() { _ = sidecar.Stop() }()
 					evoClient = sidecar.Client()
+				} else if req.ErrOut != nil {
+					fmt.Fprintf(req.ErrOut, "[evolution] failed to start sidecar at %s: %v\n", sockPath, scErr)
 				}
 			}
+		} else if req.ErrOut != nil {
+			fmt.Fprintf(req.ErrOut, "[evolution] sidecar not reachable at %s (%v)\n", sockPath, pingErr)
 		}
 	}
 
