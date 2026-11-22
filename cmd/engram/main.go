@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"engram/internal/control"
+	"engram/internal/ipc"
 	"engram/internal/store"
 	"engram/internal/worktree"
 	"engram/ui"
@@ -62,15 +63,35 @@ func (defaultAgentRunner) Run(ctx context.Context, req RunRequest) error {
 		return err
 	}
 
+	var evoClient control.EvolutionClient
+	if sockPath, sockErr := ipc.SocketPathForRepo(req.Workspace.RepoRoot); sockErr == nil {
+		candidate := ipc.NewClient(sockPath, 0)
+		pingCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		_, pingErr := candidate.Ping(pingCtx)
+		cancel()
+
+		if pingErr == nil {
+			evoClient = candidate
+		} else if compilerDir := strings.TrimSpace(os.Getenv("ENGRAM_COMPILER_DIR")); compilerDir != "" {
+			if pyBin, pyErr := control.ResolvePythonBinary(); pyErr == nil {
+				if sidecar, scErr := ipc.StartSidecar(ctx, pyBin, compilerDir, sockPath); scErr == nil {
+					defer func() { _ = sidecar.Stop() }()
+					evoClient = sidecar.Client()
+				}
+			}
+		}
+	}
+
 	loop, err := control.NewAgentLoop(control.AgentLoopConfig{
-		Workspace:   req.Workspace,
-		Config:      req.Config,
-		Manifest:    req.Manifest,
-		Store:       req.Store,
-		Router:      router,
-		WorktreeMgr: wtMgr,
-		Out:         req.Out,
-		ErrOut:      req.ErrOut,
+		Workspace:       req.Workspace,
+		Config:          req.Config,
+		Manifest:        req.Manifest,
+		Store:           req.Store,
+		Router:          router,
+		WorktreeMgr:     wtMgr,
+		EvolutionClient: evoClient,
+		Out:             req.Out,
+		ErrOut:          req.ErrOut,
 	})
 	if err != nil {
 		return err
