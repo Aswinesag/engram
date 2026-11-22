@@ -1,7 +1,5 @@
 # ENGRAM
 
-# ENGRAM
-
 **Self-Evolving Local Agent Runtime & Deterministic Harness Compiler**
 
 Named after the neuroscience term for a physical memory trace stored in tissue, **Engram** is a standalone, local-first agentic runtime that converts fleeting LLM failure loops and execution friction into permanent, executable, Git-versioned code artifacts (`.engram/`) inside your workspace.
